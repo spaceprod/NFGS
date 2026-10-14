@@ -71,6 +71,7 @@ def main():
             + shlex.quote(a.gh) + " auth git-credential",
         ]
     )
+    command([sys.executable, str(ROOT / "scripts/check_publication_contents.py")])
     command(["git", "add", "."])
     changed = command(["git", "diff", "--cached", "--quiet"], check=False)
     if changed.returncode:

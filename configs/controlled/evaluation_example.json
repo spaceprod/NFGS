@@ -1,0 +1,6 @@
+{
+ "schema_version":1,"case":"manufactured_example","method":"identity_test",
+ "scoring_slices_zyx":[[0,5,1],[0,7,1],[0,9,1]],
+ "CCI_cutoff_fractions":[1e-8,0.01,0.05],
+ "gaussian_separation":{"mean_bz_policy":"uniform_open","horizontal_zero_mode_policy":"frozen_linear_harmonic","d0_zero_mode_policy":"project","source_zero_mode_policy":"project","harmonic_residual_policy":"diagnose","mean_mode_tolerance":1e-6,"source_zero_mode_tolerance":0.01,"gaussian_horizontal_operator":"spectral"}
+}

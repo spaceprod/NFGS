@@ -1,0 +1,35 @@
+{
+  "status": "design_and_scalar_evaluator_verified_not_full_comparison",
+  "NF2_repository": "https://github.com/RobertJaro/NF2",
+  "NF2_commit": "e7b3ae97dcb37161aea6cd9510d9235de396270a",
+  "NF2_source_sha256": {
+    "nf2/train/config.py": "93a89a317fb39f0caa7fae0305b5d5748ec5ab34996b8093c2606aedd5380e55",
+    "nf2/loader/cartesian.py": "5f7734b5c6437525fa6718f208a35ff49870460286ea1ce60798ca582329d2fd",
+    "nf2/loader/cartesian_datasets.py": "d881ef791ba4af9371c590d68f8a412ebdb47a21c9c2024925221e65bae409e0",
+    "nf2/configs/benchmark/analytical_case2.yaml": "e62a33ccb545e51884e3ada86a6c4867ffd82a1903a80c925e8cfa0bba3b9974",
+    "LICENSE": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+  },
+  "NF2_public_schema_normalization_passed": true,
+  "NF2_template_training_steps_cap": 15000,
+  "NF2_template_geometry_and_normalization_require_case_specific_resolution": true,
+  "NF2_runtime_tested": false,
+  "NFPT_original_source_present": true,
+  "scalar_evaluator_analytic_tests": 3,
+  "primary_jobs_planned": 234,
+  "NF2_trainings_planned": 180,
+  "new_comparison_experiments_completed": 0,
+  "full_topology_energy_helicity_pipeline_for_controlled_runs_completed": false,
+  "NFPT_source_sha256": {
+    "nfpt_1.0.2.f90": "e5e9f169bf42513468173b247fe3246470354c1f3d4d21f80a585cf40fd82648",
+    "nfptpack_1.0.0.f90": "8f6c0e07570fed43e5d456e0d938bfc8aa9e3ccdb9493ef966cf745455a11ddc"
+  },
+  "NFPT_source_redistribution_license_confirmed": false,
+  "notebook_code_cells_executed": 4,
+  "notebook_errors": 0,
+  "NFPT_distribution_policy": "private_solver_not_published",
+  "NFPT_private_build_script_published": false,
+  "NFPT_private_local_build_verified": true,
+  "tests_passed": 6,
+  "public_tree_and_history_private_solver_check": "passed",
+  "NFPT_release_archive_contains_only_Bx_By_Bz_Jx_Jy_Jz_arrays": true
+}
