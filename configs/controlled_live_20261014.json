@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "status": "frozen_for_direct_production",
+  "TD_cases": [
+    "td1",
+    "td2",
+    "td3"
+  ],
+  "Low_Lou_cases": [
+    "low_lou_ll1",
+    "low_lou_ll2",
+    "low_lou_c2"
+  ],
+  "NFGS": {
+    "rho_grid": [
+      0,
+      0.1,
+      0.2,
+      0.3,
+      0.4,
+      0.5,
+      0.6,
+      0.7,
+      0.8,
+      0.9,
+      1
+    ],
+    "low_lou_rho_grid": [
+      0,
+      0.5,
+      1
+    ],
+    "dtype": "float32"
+  },
+  "NF2": {
+    "repository": "https://github.com/RobertJaro/NF2",
+    "source_commit": "e7b3ae97dcb37161aea6cd9510d9235de396270a",
+    "boundary_weight_multipliers": [
+      0.01,
+      0.025118864315095794,
+      0.06309573444801933,
+      0.15848931924611143,
+      0.3981071705534973,
+      1,
+      2.511886431509582,
+      6.309573444801936,
+      15.848931924611142,
+      39.810717055349734,
+      100
+    ],
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "primary_boundary_information": "bottom_only",
+    "potential_boundary_type": "none",
+    "field_representation": "vector_potential",
+    "boundary_loss_weight": 1,
+    "force_free_loss_weight": 0.001,
+    "loss_scaling": [],
+    "template_data_iterations": 1000,
+    "template_epochs": 15,
+    "training_budget_status": "fixed_15000_steps_without_pilot_by_user_instruction",
+    "precision": "32-true",
+    "reference_field_used_in_training_or_checkpoint_selection": false,
+    "template": "configs/controlled/nf2_bottom_only_template.json",
+    "matmul_precision": "highest",
+    "allow_tf32": false
+  },
+  "NFPT": {
+    "fortran_source_revision": "local_archive_nfpt_1.0.2_and_nfptpack_1.0.0_checksum_identified",
+    "fortran_source_license": null,
+    "native_precision": "real(kind=8): float64",
+    "GPU_baseline_class": "nfgs_solver.NFPTSolverGPU",
+    "equivalence_to_fortran": "requires_verification",
+    "source_environment_variable": "NFPT_SOURCE_ROOT",
+    "source_files_sha256": {
+      "nfpt_1.0.2.f90": "e5e9f169bf42513468173b247fe3246470354c1f3d4d21f80a585cf40fd82648",
+      "nfptpack_1.0.0.f90": "8f6c0e07570fed43e5d456e0d938bfc8aa9e3ccdb9493ef966cf745455a11ddc"
+    },
+    "source_redistributed": false,
+    "distribution_policy": "PRIVATE: never publish Fortran source, executable, or local build scripts",
+    "public_reproducibility_limit": "NFPT execution requires separately authorized access to the private solver; common evaluation and archived comparison data remain public"
+  },
+  "timing": {
+    "warmup_runs": 1,
+    "measured_repeats": 5,
+    "cuda_synchronize_brackets": true,
+    "quality_thresholds": [
+      {
+        "C_vec_min": 0.95,
+        "sigma_J_max": 0.25,
+        "E_rel_Bgt_max": 0.3
+      },
+      {
+        "C_vec_min": 0.97,
+        "sigma_J_max": 0.15,
+        "E_rel_Bgt_max": 0.2
+      },
+      {
+        "C_vec_min": 0.98,
+        "sigma_J_max": 0.1,
+        "E_rel_Bgt_max": 0.1
+      }
+    ],
+    "quality_threshold_status": "predeclared_before_NF2_production"
+  },
+  "sensitivities": {
+    "TD1_spacing_factors": [
+      2,
+      1,
+      0.5
+    ],
+    "scaling_spacing_factors": [
+      2,
+      1.5,
+      1,
+      0.5
+    ],
+    "patience": [
+      20,
+      40,
+      80
+    ],
+    "stopping_threshold_multipliers": [
+      0.1,
+      1,
+      10
+    ],
+    "CCI_cutoff_fractions": [
+      1e-08,
+      0.01,
+      0.05
+    ],
+    "noise_levels_rms": [
+      {
+        "Bz": 0,
+        "Bh": 0
+      },
+      {
+        "Bz": 0.005,
+        "Bh": 0.02
+      },
+      {
+        "Bz": 0.02,
+        "Bh": 0.1
+      }
+    ],
+    "noise_seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "execution_gates": [
+    "coordinate-explicit case bundles and P0 scalar tests",
+    "NFPT private solver fingerprint and settings",
+    "matched actual Fortran/GPU calculation coordinates",
+    "NF2 numpy x-y transpose and bottom-only dataset inspection",
+    "anisotropic FastQSL/potential/helicity support",
+    "fixed 15000 production steps, no separate pilot"
+  ],
+  "execution_notes": {
+    "LL_controlled_resolution": [
+      80,
+      80,
+      80
+    ],
+    "LL_original_paper_resolution_preserved_as_supplement": [
+      80,
+      80,
+      72
+    ],
+    "exact_box_resolution_Fortran_limitation": "unmodified native solver is isotropic; no invalid anisotropic coordinate reinterpretation",
+    "NFGS_and_NFPT_GPU_torch": "2.4.0",
+    "NF2_torch": "2.6.0, required by pinned upstream; recorded implementation environment difference",
+    "Fortran_solver_policy": "private; never publish source, executable, or local adapter",
+    "no_pilot": true,
+    "NF2_noise_testing_uses_paired_dimensionless_input_noise_not_claimed_HMI_errors": true
+  },
+  "submission_administrative_items": [
+    "funding information",
+    "real archival DOI; never fabricate"
+  ]
+}

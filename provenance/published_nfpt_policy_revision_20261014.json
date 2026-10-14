@@ -1,0 +1,24 @@
+{
+  "policy_id": "published_nfpt_fixed_v2",
+  "original_jobs": 644,
+  "active_jobs": 512,
+  "reused_completed": 25,
+  "archived_jobs": 132,
+  "source_solver_sha256": "3cf032f3f86517708580f78469b884047242e191ec6d6a5431bde60da15d6a7a",
+  "published_scores_sha256": "fe0a81d329b37620fa15622b0f91ddf342a0c638d4075add4c1a5c05de952e87",
+  "training_budgets_or_active_scientific_settings_changed": false,
+  "live_optimizer_preserved": true,
+  "published_nfpt_replaced": false,
+  "original_protocol_equivalence_verified": false,
+  "new_methods": [
+    "NFGS",
+    "NF2"
+  ],
+  "private_fortran_redistributed": false,
+  "completed_padding_evidence": {
+    "main": 99,
+    "TD3_auxiliary": 3,
+    "local_NFPT_reproduction": 7
+  },
+  "steady_end_to_end_timing_for_future_runs": true
+}

@@ -138,38 +138,35 @@ See `docs/reproduction.md` for the manuscript-to-experiment mapping and
 Please cite the accompanying NFGS manuscript and Yi et al. (2022) for NFPT.
 FastQSL retains its CC BY-NC-SA 4.0 license; see `THIRD_PARTY.md`.
 
-## Controlled comparison design (not yet executed)
+## Published NFPT benchmark and live NFGS–NF2 comparison
 
-The [NFPT–NF2 comparison plan](docs/controlled_comparison_plan_ko.md) separates
-archived evidence from future matched-input experiments and manuscript claims.
-NF2's verified upstream commit, bottom-only requirements, matched tuning budgets,
-timing boundaries, sensitivity studies and source/coordinate gates are in
-`configs/controlled_comparison.json`. The design is deliberately marked draft.
+The [revised comparison plan](docs/controlled_comparison_plan_ko.md) preserves
+published NFPT/VFVP/SSW scores and executes NFGS–NF2 under a common canonical
+input and FD2/GS protocol. The frozen configuration is
+`configs/controlled_published_nfpt_20261014.json`. Original NFPT reference,
+coordinate, scoring and current-operator equivalence is a separate verification
+gate; shared TD parameters alone do not establish it.
 
 ```bash
 python scripts/plan_controlled_comparison.py --output results/controlled_design/jobs.json
-python scripts/build_comparison_report.py --output-dir results/controlled_design/report
-python evaluate.py --reference case/reference.npz --field run/field.npz \
-  --boundary case/boundary.npz --config case/evaluation.json --output run/metrics.json
+PYTHONPATH=. python scripts/run_controlled_status.py
+PYTHONPATH=. python scripts/build_live_comparison_report.py --root results/controlled/live_20261014
 ```
 
-`evaluate.py` requires explicit coordinates and units; it never infers a grid
-from a shape or accepts solver-specific current arrays for scoring. It uses
-common full-volume FD2 curl and full-footprint GS, with pixel/cutoff and global
-L2 CCI errors. FastQSL, twist, energy/helicity and method adapters remain separate
-implementation gates; generating a draft job list does not run these methods.
-The report command reproduces **archived** full-rho and precision tables only.
+The live revised queue contains 512 NFGS/NF2 jobs. Existing inputs, fixed NF2
+15,000-step budgets, five seeds, and completed fields are reused. Local PT jobs,
+logs and archived fields remain separate implementation evidence. Policy and
+snapshot hashes prevent their CCI or runtime from being substituted into the
+published rows. The public `scripts/run_nf2_controlled.py` adapter uses a separately installed
+pinned NF2 environment; upstream NF2 is not vendored. The [overview notebook](notebooks/controlled_comparison_overview.ipynb)
+shows live progress, separate published scores, new Pareto points and timings.
 
-The NFPT **Fortran** solver is private: neither its source, executables nor local
-build scripts are included in this repository or releases. Common evaluation
-and archived comparison fields remain public; NFPT execution requires separate
-authorized access to the private solver. Before any publication, run:
+`evaluate.py` requires explicit coordinates/units and uses full-volume FD2 curl
+and full-footprint GS before cropping. All executed rows identify the actual
+protocol. When an original publication protocol is supplied and verified,
+saved fields can be re-evaluated; changed inputs require separate new runs.
 
-```bash
-python scripts/check_publication_contents.py
-```
-
-The controlled-comparison overview is in
-`notebooks/controlled_comparison_overview.ipynb`. The verified, case-dependent
-NF2 template is `configs/controlled/nf2_bottom_only_template.json`; placeholders
-and geometry/normalization must be resolved before training.
+The NFPT Fortran solver is private. Sources, executables, build scripts and
+local execution adapters are excluded from the public repository and releases.
+Common evaluation and archived comparison data remain available. Before
+publication, run `python scripts/check_publication_contents.py`.
