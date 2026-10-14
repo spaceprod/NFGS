@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "id": "rho_gamma_scaling",
+  "description": "Fixed physical domains and gamma scaling across resolutions",
+  "entrypoint": "nfgs._backend.experiments.nfgs_paper.rho_gamma_scaling.run",
+  "arguments": {
+    "output_dir": "{output_root}/rho_gamma_scaling",
+    "device": "{device}",
+    "max_iter": "3000",
+    "dtype": "float32"
+  },
+  "depends_on": [
+    "preflight"
+  ],
+  "artifacts": [
+    "{output_root}/rho_gamma_scaling/metrics_all.csv"
+  ],
+  "supports_force": true
+}

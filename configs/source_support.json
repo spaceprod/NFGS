@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "id": "source_support",
+  "description": "Independent below/above compact-current source attribution",
+  "entrypoint": "nfgs._backend.experiments.nfgs_paper.source_support_manufactured.run",
+  "arguments": {
+    "output_dir": "{output_root}/source_support_manufactured",
+    "resolutions": "33,65,97",
+    "segments": 2048,
+    "extent": 2
+  },
+  "depends_on": [
+    "preflight"
+  ],
+  "artifacts": [
+    "{output_root}/source_support_manufactured/metrics.csv"
+  ],
+  "profiles": {
+    "quick": {
+      "arguments": {
+        "resolutions": "17,33",
+        "segments": 128
+      }
+    }
+  }
+}

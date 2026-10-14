@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "rho_figures",
+  "description": "CCI and force-freeness trade-off and practical weight selection",
+  "entrypoint": "nfgs._backend.experiments.nfgs_paper.rho_knee_figures.run",
+  "arguments": {
+    "diagnostic_dir": "{output_root}/common_diagnostics",
+    "output_dir": "{output_root}/figures"
+  },
+  "depends_on": [
+    "common_diagnostics"
+  ],
+  "artifacts": []
+}

@@ -1,0 +1,67 @@
+{
+  "status": "local_refactor_verified",
+  "original_source_files_unchanged": true,
+  "standalone_equivalence": "bitwise equality for three initializations and one nonlinear iteration; see standalone_equivalence.json",
+  "quick_campaign_completed": true,
+  "quick_campaign_scientific_evidence": false,
+  "notebook_code_cells_executed": 14,
+  "notebook_errors": 0,
+  "config_arguments": "checked against each actual entrypoint; see config_argument_validation.json",
+  "GPU_validation": {
+    "benchmark": "TD2",
+    "rho": 0.5,
+    "stop_reason": "sigma_stall",
+    "iterations": 336,
+    "best_iter": 296,
+    "timed_solver_seconds": 28.67941584000073,
+    "metric_comparison": {
+      "C_vec": {
+        "fresh": 0.9858738380380678,
+        "archived": 0.9856340461850094,
+        "difference": 0.00023979185305844641
+      },
+      "C_CS": {
+        "fresh": 0.9858753536707423,
+        "archived": 0.9855807041969522,
+        "difference": 0.0002946494737900984
+      },
+      "Eprime_n": {
+        "fresh": 0.8488600241586004,
+        "archived": 0.8477066404856112,
+        "difference": 0.0011533836729892277
+      },
+      "Eprime_m": {
+        "fresh": 0.8461770320491666,
+        "archived": 0.8448448897614629,
+        "difference": 0.0013321422877037303
+      },
+      "epsilon": {
+        "fresh": 0.8717260974580415,
+        "archived": 0.8717091123389691,
+        "difference": 1.698511907244349e-05
+      },
+      "sigma_J": {
+        "fresh": 0.0820048664458522,
+        "archived": 0.08205126222559524,
+        "difference": -4.6395779743038656e-05
+      }
+    },
+    "full_33_row_matrix_rerun": false
+  },
+  "input_archive_and_three_npz_checksums_verified": true,
+  "publication_status": "prepared_for_public_release",
+  "manuscript_code_availability": "availability text is provided in docs/manuscript_code_availability.md; author manuscript is updated after verified publication",
+  "source_project_changed": false,
+  "experiment_script_count": 21,
+  "script_config_pairs_complete": true,
+  "installed_project_quick_campaign_completed": true,
+  "installed_project_path": "/home/kim-yj/Projects/2026/NFGS",
+  "isolated_project_environment": {
+    "python": "3.12",
+    "numpy": "1.26.4",
+    "install": "editable",
+    "notebook_kernel": "nfgs"
+  },
+  "low_lou_physical_parameters_applied_from_configs": true,
+  "publication_repository": "https://github.com/spaceprod/NFGS"
+}

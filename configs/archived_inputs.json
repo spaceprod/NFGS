@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "archived_inputs",
+  "description": "archived inputs",
+  "entrypoint": "nfgs.inputs",
+  "arguments": {
+    "manifest": "{project_root}/configs/archived_inputs_manifest.json",
+    "destination": "{project_root}/data/nfpt"
+  },
+  "depends_on": [
+    "preflight"
+  ],
+  "artifacts": [
+    "{project_root}/data/nfpt/td1__nfpt_fortran_symmetric.npz",
+    "{project_root}/data/nfpt/td2__nfpt_fortran_symmetric.npz",
+    "{project_root}/data/nfpt/td3__nfpt_fortran_symmetric.npz"
+  ]
+}

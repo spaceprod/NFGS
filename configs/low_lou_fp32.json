@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "id": "low_lou_fp32",
+  "description": "Low--Lou LL1, LL2 and LL3 at rho=0.5 in single precision",
+  "entrypoint": "nfgs._backend.experiments.nfgs_paper.analytic_nlfff.run",
+  "arguments": {
+    "output_dir": "{output_root}/low_lou_family_rho0p5/float32",
+    "field_cache_dir": "{output_root}/low_lou_family_rho0p5/float32/fields",
+    "benchmarks": "low_lou_c2,low_lou_ll1,low_lou_ll2",
+    "mixed_robin_weight": "0.5",
+    "device": "{device}",
+    "dtype": "float32",
+    "max_iter_lnl": "3000",
+    "stop_mode": "sigma_best",
+    "tol": "1e-5",
+    "patience": "40",
+    "sigma_improvement_tol": "1e-5",
+    "record_iteration_diagnostics": true
+  },
+  "depends_on": [
+    "preflight"
+  ],
+  "artifacts": [
+    "{output_root}/low_lou_family_rho0p5/float32/metrics.csv"
+  ],
+  "supports_force": true,
+  "profiles": {
+    "quick": {
+      "arguments": {
+        "benchmarks": "low_lou_c2",
+        "max_iter_lnl": 3
+      }
+    }
+  },
+  "low_lou_cases": {
+    "low_lou_c2": {
+      "n": 1,
+      "m": 1,
+      "l": 0.3,
+      "psi": 0.47123889803846897
+    },
+    "low_lou_ll1": {
+      "n": 1,
+      "m": 1,
+      "l": 0.3,
+      "psi": 0.7853981633974483
+    },
+    "low_lou_ll2": {
+      "n": 3,
+      "m": 1,
+      "l": 0.3,
+      "psi": 2.5132741228718345
+    }
+  }
+}

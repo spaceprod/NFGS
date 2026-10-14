@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "id": "extended_manufactured",
+  "description": "Compatible and incompatible mixed rows and complete PT fields",
+  "entrypoint": "nfgs._backend.experiments.nfgs_paper.extended_manufactured.run",
+  "arguments": {
+    "output_dir": "{output_root}/extended_manufactured",
+    "device": "{device}",
+    "dtypes": "float32,float64",
+    "grids": "17,33,65",
+    "mixed_rhos": "0,0.4,1",
+    "complete_rho": 0.4
+  },
+  "depends_on": [
+    "preflight"
+  ],
+  "artifacts": [
+    "{output_root}/extended_manufactured/summary.json"
+  ],
+  "profiles": {
+    "quick": {
+      "arguments": {
+        "grids": "9,17,33"
+      }
+    }
+  }
+}

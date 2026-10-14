@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "audit",
+  "description": "Check full weight coverage, numerical provenance and manuscript stopping rules",
+  "entrypoint": "nfgs.audit",
+  "arguments": {
+    "output_root": "{output_root}"
+  },
+  "depends_on": [
+    "common_diagnostics",
+    "reader_diagnostics",
+    "twist_apex",
+    "six_face_helicity"
+  ],
+  "artifacts": [
+    "{output_root}/reproduction_audit.json"
+  ]
+}

@@ -1,0 +1,191 @@
+{
+  "source_project": "NFPT_CCU_RBSL_validation",
+  "description": "Read-only export; source numerics were not modified. Portable imports and paths are refactored in this project.",
+  "sources": [
+    {
+      "source": "experiments/nfgs_paper/analytic_nlfff/__init__.py",
+      "sha256": "cf3bf160d5deae3a520c6935e78472baa7143253a0cbf53a1de6c6fad407864f"
+    },
+    {
+      "source": "experiments/nfgs_paper/analytic_nlfff/benchmarks.py",
+      "sha256": "2d79602eabeb112800ce3b499dc3a0eac9e3921be924cd353e1ae03f2778495e"
+    },
+    {
+      "source": "experiments/nfgs_paper/analytic_nlfff/run.py",
+      "sha256": "6d400dfbfe61cda76b96bd601f3726cac28a91e6dbf50dbf9805d0725e3ba689"
+    },
+    {
+      "source": "experiments/nfgs_paper/extended_manufactured/run.py",
+      "sha256": "cf275f5031939d5d17f15a6a21997796771ad8c0ada670d4d9c73a79662a8bad"
+    },
+    {
+      "source": "experiments/nfgs_paper/factorized_ablation/run.py",
+      "sha256": "173958c068080d04c921733ffdf9c139fc385c84666df94a71733d8fd69df509"
+    },
+    {
+      "source": "experiments/nfgs_paper/modal_verification/run.py",
+      "sha256": "ab7aa5cdc40af5d5bb260e1cd17852c92bcfb6f5a3003f05b079a4f836bc2eba"
+    },
+    {
+      "source": "experiments/nfgs_paper/quantitative_topology/run.py",
+      "sha256": "cd9ce5071303e113662fdf5a0c8e6d0b52aaa2cc6427677d677c7d9f3938c345"
+    },
+    {
+      "source": "experiments/nfgs_paper/regularization/run.py",
+      "sha256": "c412ea36d5dae7ce74555b6a9b680aa3d70fa5509b00d822de24b1b226823c5c"
+    },
+    {
+      "source": "experiments/nfgs_paper/rho_gamma_scaling/run.py",
+      "sha256": "d883c5b21b5a97832fe4ab1536b3ec6d9c65c4d909b940973931dee36fa34e6f"
+    },
+    {
+      "source": "experiments/nfgs_paper/rho_knee_figures/run.py",
+      "sha256": "deac8760c2224fa3603ccf9b4cc4c9f13842a0aad20962dc4eea880b18b6e81a"
+    },
+    {
+      "source": "experiments/nfgs_paper/six_face_helicity/run.py",
+      "sha256": "10ba38da3f66d2e00255f93b12947b7494247889e12a9ca4d093a3e0b07cdab1"
+    },
+    {
+      "source": "experiments/nfgs_paper/source_support_manufactured/run.py",
+      "sha256": "00e2b64069b5dd323821845bd2f2aafb6cc87c4609f1dbafb498c13ea5dd5f3e"
+    },
+    {
+      "source": "experiments/nfgs_paper/td_resolution_sweep/run.py",
+      "sha256": "cb14c6046b5877cc920608d44cac7c6ebe9c46cb6e86d7b1039474243c455049"
+    },
+    {
+      "source": "experiments/nfgs_paper/twist_apex/run.py",
+      "sha256": "b5db874681c9d390899a578a056ec34751afa8a8bb4c41252033e4bd5e6a25f6"
+    },
+    {
+      "source": "nfgs_validation/common_fd2.py",
+      "sha256": "5219963a17923916bf0908ef7210fc8a8202dddfc2d340e8efbeff5b57b4e6d2"
+    },
+    {
+      "source": "nfgs_validation/helicity_diagnostics.py",
+      "sha256": "0c3b88244c66ce9a3968fef1d5a8146df98ce3f6c997e9dc065f3517ff5c037b"
+    },
+    {
+      "source": "nfgs_validation/topology_metrics.py",
+      "sha256": "30de4737f3030d9f5c44f384c3c3fb79e1b5b3913db2554bfaaebdcb752ba497"
+    },
+    {
+      "source": "nfgs_validation/volume_diagnostics.py",
+      "sha256": "28f53091a2635312218b104585c794a2bacdf25ee91651d33bda4bef8dbd31fc"
+    },
+    {
+      "source": "scripts/build_nfgs_second_readability_evidence.py",
+      "sha256": "74d295b47771b7e1a1ed0d2bf0a54f3fcbbabf3a813eb98c5c570a139a855c9e"
+    },
+    {
+      "source": "scripts/build_nfgs_standalone.py",
+      "sha256": "a8cbd1fc0c710e9a4297d22c7a9bed03e1600d396032de2399125bcd40076ee0"
+    },
+    {
+      "source": "scripts/nfgs_figure_style.py",
+      "sha256": "a61d07413a10bbb8200ac4c9b7f011c3fef5f6185d8575bc331762e7ccfc4a33"
+    },
+    {
+      "source": "scripts/plot_nfgs_referee_revision_figures.py",
+      "sha256": "2e519326fa0d4f71d82ad5dc203b77c66395a70f907a78740a672590ddef3d71"
+    },
+    {
+      "source": "scripts/plot_nfgs_td_robin_bgt_compare.py",
+      "sha256": "2991b37abeedfb9454a60cda3943d2499195a1fb3fa4073e787d8f92a2c41017"
+    },
+    {
+      "source": "scripts/plot_nfgs_td_robin_metrics_vs_er.py",
+      "sha256": "63444489ddb64e31f7812bf9eb5803583ec02396a8a1605c871a345c0253400b"
+    },
+    {
+      "source": "scripts/plot_td_referee_figures.py",
+      "sha256": "061561db264f19cfd1d42296ad36f4057b04ae0e8f0aae4557a752f1f934f2b4"
+    },
+    {
+      "source": "scripts/recompute_td_referee_diagnostics.py",
+      "sha256": "f71c49846a01601100203e319c96b4f30382f4bd56dfad91fbb786a8e7bf4e1a"
+    },
+    {
+      "source": "scripts/run_analytic_validation.py",
+      "sha256": "b590aecf4ea7a479069517bdc572d21bf4a531e3b402846d663b472dcfda2cfd"
+    },
+    {
+      "source": "scripts/run_nfgs_analytic_validation.py",
+      "sha256": "274cbf6afee86e65cd88671b4ff6964bb4683222a99df33c9426e2d310e2493d"
+    },
+    {
+      "source": "scripts/run_nfgs_td_robin_weight_sweep.py",
+      "sha256": "4e3b7b4397bc26152dd628d4d877d456590c0aee8ae8ad0ae509e7e9029742c9"
+    },
+    {
+      "source": "scripts/run_nfpt_fortran_symmetric_td3_reconstruction.py",
+      "sha256": "af4fe9a67d61a5ccac922a06d467a217fce8934439588df75039a8bb287c9528"
+    },
+    {
+      "source": "scripts/run_nfpt_fortran_symmetric_td_reconstruction.py",
+      "sha256": "220bb9e4d2ae6e2a74d6be68640e42be3df8a25fecc4b6082b59182131a5f3c1"
+    },
+    {
+      "source": "scripts/run_nfpt_fortran_td_reconstruction.py",
+      "sha256": "2ec40728c9344d02c3a25eaa96a684fccd7e36731e233a7b6255c54ffc65dc5b"
+    },
+    {
+      "source": "solvers/nfgs/nfgs_solver.py",
+      "sha256": "9a638e95c8da9525d79e606b1ed533e5c4f2b96ad92070f3969beeb27b00d566"
+    },
+    {
+      "source": "solvers/nfpt_stable/_nfpt_base.py",
+      "sha256": "4ebb6b8023a54e243fd2f20d11e23dc3324529c3a598546ad392c2ce27c89aaa"
+    },
+    {
+      "source": "solvers/nfpt_stable/nfpt_solver.py",
+      "sha256": "e29420207dc4c2b0a6798e654bf236215a5bb0626007f860569201319c4f7c91"
+    },
+    {
+      "source": "td.py",
+      "sha256": "ec100a6d030349147520c059f7caa5ac30fd4fcd66623b8c497f99a1b36601e2"
+    },
+    {
+      "source": "util/fastqsl_plane.py",
+      "sha256": "f0e39f0fec1b8209478be75a4020694b186a729d042ece115e6da157eeca31b2"
+    },
+    {
+      "source": "util/field_ops.py",
+      "sha256": "68258b5fd6ec7bfaa23ea3efc32bdc933a9fac11d5f69ad6afcef39a62dad490"
+    },
+    {
+      "source": "util/flh_potential_gpu.py",
+      "sha256": "9037ea105be6591be81111fd5514a0811ec038d4c997a065a28d3ed36608c57a"
+    },
+    {
+      "source": "util/lnl_io.py",
+      "sha256": "1e41f6275868691c06928e4533eee30ef8145966725b958de29cca42c1cc916e"
+    },
+    {
+      "source": "util/metrics.py",
+      "sha256": "7bee2058f05622f401c5fc326d7893a6bc2bb7631fc37a0a5d9376a8580df4ee"
+    },
+    {
+      "source": "util/nfpt_fortran_compat.py",
+      "sha256": "5159ca63ad26d29a6a68c5294324df6029682ce7202207ca251284d3d2e06202"
+    },
+    {
+      "source": "util/td2_io.py",
+      "sha256": "0615d0622581941e979befa0e69fa74c91e4199f7f04a343853f01e8d37b6f7a"
+    },
+    {
+      "source": "util/td2_viz.py",
+      "sha256": "e82e9e876214a273c9094a4d0e267f423e295f2b242ed9faeed8fa8afffab2bb"
+    },
+    {
+      "source": "util/td_viz.py",
+      "sha256": "35d82a66d3c4e7fa1ba08f747b95334642e96e707937ffeb452d46367fd3a558"
+    },
+    {
+      "source": "util/td_viz_config.py",
+      "sha256": "fbb0a5de0d33fcc014650d5ddaa9b4e6e4b9e04bdac25349e0e600eb81927d1f"
+    }
+  ],
+  "standalone_sha256": "3cf032f3f86517708580f78469b884047242e191ec6d6a5431bde60da15d6a7a"
+}

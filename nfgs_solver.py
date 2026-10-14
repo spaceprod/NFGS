@@ -1,0 +1,7130 @@
+#!/usr/bin/env python3
+"""Standalone Gaussian-separated NFPT (NFGS) solver.
+
+Exported from the active research implementation; the original source
+fingerprints are embedded below. This file intentionally embeds the NFGS solver, the stable
+PT/NFPT numerical base, and the legacy-compatible grid helper.  It has no
+imports from this repository; only NumPy and PyTorch are required.
+
+Public API
+----------
+``NFGSSolverGPU``
+    Gaussian-separated nonlinear force-free field solver.
+``compute_mbsl_boundary_metrics``
+    Optional bottom-boundary consistency diagnostics.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+from typing import Callable, Literal, Optional, Tuple
+import warnings
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+__version__ = "2026.10.13"
+__all__ = ["NFGSSolverGPU", "compute_mbsl_boundary_metrics"]
+STANDALONE_SOURCE_SHA256 = {
+    "grid": "5159ca63ad26d29a6a68c5294324df6029682ce7202207ca251284d3d2e06202",
+    "base": "4ebb6b8023a54e243fd2f20d11e23dc3324529c3a598546ad392c2ce27c89aaa",
+    "stable": "e29420207dc4c2b0a6798e654bf236215a5bb0626007f860569201319c4f7c91",
+    "nfgs": "9a638e95c8da9525d79e606b1ed533e5c4f2b96ad92070f3969beeb27b00d566",
+}
+
+# The standalone NFGS public API does not expose the legacy Auto-RBSL
+# initializer, but these aliases remain because inherited private signatures
+# retain their annotations.
+RbslAxisMode = Literal["semicircle", "jhook_pil"]
+RbslKernelMode = Literal["paper", "smooth"]
+RbslParameterMode = Literal["paper_force_free", "t_footprint", "disk"]
+RbslBackend = Literal["torch", "cupy"]
+
+
+# =============================================================================
+# FORTRAN-COMPATIBLE GRID
+# =============================================================================
+@dataclass(frozen=True)
+class NFPTFortranGrid:
+    """Observed-grid metadata implied by ``nfpt_1.0.2.f90``."""
+
+    nxo: int
+    nyo: int
+    nzo: int
+    nx: int
+    ny: int
+    nz: int
+    bfx: int
+    bfy: int
+    bfz: int
+    dx: float
+    dy: float
+    dz: float
+    x_bounds: Tuple[float, float]
+    y_bounds: Tuple[float, float]
+    z_bounds: Tuple[float, float]
+    padded_x_bounds: Tuple[float, float]
+    padded_y_bounds: Tuple[float, float]
+    padded_z_bounds: Tuple[float, float]
+
+
+def _mudpack_axis_size(n_obs: int) -> int:
+    """Return the padded MUDPACK-friendly size selected by ``mudcof``."""
+    n_obs = int(n_obs)
+    if n_obs < 2:
+        return max(1, n_obs)
+    n_real = float(n_obs)
+    exp2 = math.ceil(math.log((n_real - 1.0) / 2.0) / math.log(2.0)) + 1
+    exp3 = math.ceil(math.log((n_real - 1.0) / 3.0) / math.log(2.0)) + 1
+    n2 = int(2 * (2 ** (exp2 - 1)) + 1)
+    n3 = int(3 * (2 ** (exp3 - 1)) + 1)
+    return min(n2, n3)
+
+
+def _even_xy_pad_size(n_calc: int, n_obs: int) -> int:
+    """Grow ``n_calc`` by one cell when needed so left/right pads match.
+
+    Legacy Fortran uses ``bfx = (nx - nxo) // 2``, which leaves any odd
+    remainder on the high-index side only (e.g. rem=1 → left=0, right=1).
+    For mirror-symmetric analytic benchmarks, bump the calculation size so
+    both sides receive the same pad count.
+    """
+    n_calc = int(n_calc)
+    n_obs = int(n_obs)
+    if n_calc < n_obs:
+        raise ValueError(
+            f"calculation size {n_calc} is smaller than observed size {n_obs}"
+        )
+    if (n_calc - n_obs) % 2 == 1:
+        return n_calc + 1
+    return n_calc
+
+
+def nfpt_fortran_grid(
+    nxo: int,
+    nyo: int,
+    nzo: int,
+    *,
+    symmetric_xy: bool = False,
+) -> NFPTFortranGrid:
+    """Reproduce the Fortran ``mudcof``/``initial`` coordinate spacing.
+
+    The Fortran code selects MUDPACK-friendly ``nx/ny/nz``, pads x/y with
+    ``bfx=(nx-nxo)//2`` (odd remainder on the high-index side only), and pads
+    z on top only.  It then derives one isotropic grid spacing from the padded
+    x domain.
+
+    Parameters
+    ----------
+    symmetric_xy :
+        If True, grow ``nx``/``ny`` by one cell whenever ``(n - n_obs)`` is
+        odd so that left and right (or bottom and top in y) pads are equal.
+        z padding remains Fortran-like (top only).  Default False preserves
+        bit-for-bit legacy NFPT padding.
+    """
+    nxo, nyo, nzo = int(nxo), int(nyo), int(nzo)
+    nx = _mudpack_axis_size(nxo)
+    ny = _mudpack_axis_size(nyo)
+    nz = _mudpack_axis_size(nzo)
+    if symmetric_xy:
+        nx = _even_xy_pad_size(nx, nxo)
+        ny = _even_xy_pad_size(ny, nyo)
+    bfx = (nx - nxo) // 2
+    bfy = (ny - nyo) // 2
+    bfz = nz - nzo
+    if symmetric_xy:
+        if (nx - nxo) - bfx != bfx or (ny - nyo) - bfy != bfy:
+            raise RuntimeError(
+                "symmetric_xy padding failed to equalize left/right pads: "
+                f"nx={nx}, nxo={nxo}, bfx={bfx}; ny={ny}, nyo={nyo}, bfy={bfy}"
+            )
+
+    if nx <= 1:
+        h = 1.0
+        lx = 0.0
+    else:
+        lx = float(nxo - 1) * (1.0 + float(2 * bfx) / float(nxo - 1))
+        h = 2.0 * lx / float(nx - 1)
+    ly = lx * float(ny - 1) / float(nx - 1) if nx > 1 else 0.0
+    lz = 2.0 * lx * float(nz - 1) / float(nx - 1) if nx > 1 else 0.0
+
+    padded_x = (-lx, lx)
+    padded_y = (-ly, ly)
+    padded_z = (0.0, lz)
+    x0 = padded_x[0] + float(bfx) * h
+    y0 = padded_y[0] + float(bfy) * h
+    return NFPTFortranGrid(
+        nxo=nxo,
+        nyo=nyo,
+        nzo=nzo,
+        nx=nx,
+        ny=ny,
+        nz=nz,
+        bfx=bfx,
+        bfy=bfy,
+        bfz=bfz,
+        dx=h,
+        dy=h,
+        dz=h,
+        x_bounds=(x0, x0 + float(max(nxo - 1, 0)) * h),
+        y_bounds=(y0, y0 + float(max(nyo - 1, 0)) * h),
+        z_bounds=(0.0, float(max(nzo - 1, 0)) * h),
+        padded_x_bounds=padded_x,
+        padded_y_bounds=padded_y,
+        padded_z_bounds=padded_z,
+    )
+
+
+def nfpt_fortran_spacing(nxo: int, nyo: int, nzo: int) -> Tuple[float, float, float]:
+    """Return ``(dx, dy, dz)`` implied by the legacy Fortran code."""
+    g = nfpt_fortran_grid(nxo, nyo, nzo)
+    return g.dx, g.dy, g.dz
+
+
+def bottom_jz_fortran_readin_botbal(
+    Bx: np.ndarray,
+    By: np.ndarray,
+    *,
+    dx: float,
+    dy: float,
+    ijzbcor: int = 3,
+) -> np.ndarray:
+    """Bottom ``Jz`` matching Fortran ``readin`` plus ``botbal``.
+
+    ``Bx`` and ``By`` are bottom maps in ``(Ny, Nx)`` order. The returned array
+    keeps only physical nodes, with physical edges zeroed as in Fortran.
+    """
+    bx = np.asarray(Bx, dtype=np.float64)
+    by = np.asarray(By, dtype=np.float64)
+    if bx.ndim != 2 or by.ndim != 2 or bx.shape != by.shape:
+        raise ValueError(f"Bx/By must be matching 2D arrays; got {bx.shape}, {by.shape}")
+
+    nyo, nxo = bx.shape
+    grid = nfpt_fortran_grid(nxo, nyo, 2)
+    bxb = np.zeros((grid.ny, grid.nx), dtype=np.float64)
+    byb = np.zeros_like(bxb)
+    y1 = grid.bfy + nyo
+    x1 = grid.bfx + nxo
+    bxb[grid.bfy : y1, grid.bfx : x1] = bx
+    byb[grid.bfy : y1, grid.bfx : x1] = by
+
+    jzb = np.zeros_like(bxb, dtype=np.float64)
+    if grid.nx >= 3 and grid.ny >= 3:
+        jzb[1:-1, 1:-1] = (
+            (byb[1:-1, 2:] - byb[1:-1, :-2]) / (2.0 * float(dx))
+            - (bxb[2:, 1:-1] - bxb[:-2, 1:-1]) / (2.0 * float(dy))
+        )
+
+    mode = int(ijzbcor)
+    if mode >= 2 and grid.nx >= 3 and grid.ny >= 3:
+        jzp = np.where(jzb >= 0.0, jzb, 0.0)
+        jzn = np.where(jzb < 0.0, jzb, 0.0)
+
+        def cell_sum(a: np.ndarray) -> float:
+            return float(
+                0.25
+                * (
+                    np.sum(a[1:-1, 2:])
+                    + np.sum(a[2:, 1:-1])
+                    + np.sum(a[1:-1, 1:-1])
+                    + np.sum(a[2:, 2:])
+                )
+            )
+
+        jzsum = cell_sum(jzb)
+        jzpsum = cell_sum(jzp)
+        jznsum = cell_sum(jzn)
+        if mode == 2:
+            jzflcor = jzpsum - 0.5 * jzsum
+        elif mode == 3:
+            jzflcor = max(jzpsum, abs(jznsum))
+        elif mode == 4:
+            jzflcor = min(jzpsum, abs(jznsum))
+        else:
+            jzflcor = None
+
+        if jzflcor is not None:
+            if abs(jzpsum) > 0.0:
+                jzb = np.where(jzb >= 0.0, (jzflcor / jzpsum) * jzb, jzb)
+            if abs(jznsum) > 0.0:
+                jzb = np.where(jzb < 0.0, (jzflcor / abs(jznsum)) * jzb, jzb)
+
+    if grid.nx > 0:
+        jzb[:, 0] = 0.0
+        jzb[:, -1] = 0.0
+    if grid.ny > 0:
+        jzb[0, :] = 0.0
+        jzb[-1, :] = 0.0
+    return jzb[grid.bfy : y1, grid.bfx : x1].copy()
+
+# =============================================================================
+# PT/NFPT NUMERICAL BASE
+# =============================================================================
+RhsLapXyMode = Literal["fd", "spectral"]
+SpectralLapExtBc = Literal["neumann", "dirichlet"]
+PoissonZBackend = Literal["thomas", "pcr"]
+CalculationDomainMode = Literal["mudpack", "mudpack_legacy", "bottom_padding"]
+InitialConditionMode = Literal[
+    "curl_free_current",
+    "potential",
+    "top_down_hybrid_dpt_nlfff",
+    "auto_rbsl",
+]
+AutoRbslFieldMode = Literal["projected", "direct"]
+
+# Synonyms for ``lateral_wall`` (explicit labels for benchmarks / CLI).
+LateralWallMode = Literal[
+    "potential_pin",
+    "legacy_potential_pin",
+    "BC1",
+    "paper_bc1",
+    "paper",
+]
+
+@torch.jit.script
+def _pcr_solve_batched(
+    rhs_hat: torch.Tensor,
+    u0_hat: torch.Tensor,
+    lam_xy: torch.Tensor,
+    dz: float,
+    bc_top_is_dirichlet: bool,
+    u_top_hat: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Parallel Cyclic Reduction (PCR) solver for batched tridiagonal systems.
+    Replaces the sequential Thomas solver to maximize GPU parallelism.
+    """
+    Nz = rhs_hat.size(0)
+    dz2 = dz * dz
+    n_solve = Nz - 2 if bc_top_is_dirichlet else Nz - 1
+
+    u_hat = torch.zeros_like(rhs_hat)
+    u_hat[0] = u0_hat
+
+    if n_solve <= 0:
+        if bc_top_is_dirichlet and Nz > 1:
+            u_hat[Nz - 1] = u_top_hat
+        return u_hat
+
+    # Allocate a, b, c, d coefficients as full tensors broadcast across the
+    # rfft batch dimensions so we can do all PCR updates in parallel.
+    d = rhs_hat[1 : 1 + n_solve].clone()
+
+    a = torch.full_like(d, 1.0 / dz2)
+    c = torch.full_like(d, 1.0 / dz2)
+    b = (lam_xy - 2.0 / dz2).unsqueeze(0).expand(n_solve, -1, -1).clone().to(dtype=d.dtype)
+
+    # Boundary conditions: Dirichlet bottom (u[0] = u0_hat) folds into d[0];
+    # top is either Dirichlet (fold into d[n-1]) or homogeneous Neumann via
+    # the mirrored ghost so that a[n-1] picks up factor 2/dz^2.
+    d[0] = d[0] - a[0] * u0_hat
+    a[0] = 0.0
+
+    if not bc_top_is_dirichlet:
+        a[n_solve - 1] = 2.0 / dz2
+        c[n_solve - 1] = 0.0
+    else:
+        d[n_solve - 1] = d[n_solve - 1] - c[n_solve - 1] * u_top_hat
+        c[n_solve - 1] = 0.0
+
+    # PCR sweep: ping-pong buffers (no per-step clone). All rows share the rhs
+    # dtype (complex for rfft), and only the rows that change are written into
+    # the next buffer; the others are zeroed (a, c) or copied (b, d).
+    buf_a = torch.empty_like(d)
+    buf_b = torch.empty_like(d)
+    buf_c = torch.empty_like(d)
+    buf_d = torch.empty_like(d)
+
+    parity = 0
+    step = 1
+    while step < n_solve:
+        if parity == 0:
+            cur_a = a
+            cur_b = b
+            cur_c = c
+            cur_d = d
+            nxt_a = buf_a
+            nxt_b = buf_b
+            nxt_c = buf_c
+            nxt_d = buf_d
+        else:
+            cur_a = buf_a
+            cur_b = buf_b
+            cur_c = buf_c
+            cur_d = buf_d
+            nxt_a = a
+            nxt_b = b
+            nxt_c = c
+            nxt_d = d
+
+        alpha = cur_a[step:] / cur_b[:-step]
+        gamma = cur_c[:-step] / cur_b[step:]
+
+        nxt_a.zero_()
+        nxt_b.copy_(cur_b)
+        nxt_c.zero_()
+        nxt_d.copy_(cur_d)
+
+        nxt_a[step:] = -alpha * cur_a[:-step]
+        nxt_b[step:] -= alpha * cur_c[:-step]
+        nxt_d[step:] -= alpha * cur_d[:-step]
+
+        nxt_c[:-step] = -gamma * cur_c[step:]
+        nxt_b[:-step] -= gamma * cur_a[step:]
+        nxt_d[:-step] -= gamma * cur_d[step:]
+
+        parity = 1 - parity
+        step *= 2
+
+    # Latest coefficients live in buf_* after an odd number of PCR rounds,
+    # else in the original (a, b, c, d) buffers.
+    if parity == 0:
+        use_b = b
+        use_d = d
+    else:
+        use_b = buf_b
+        use_d = buf_d
+
+    # After PCR the off-diagonals are zero, so the solution is just d / b.
+    u_inner = use_d / use_b
+    u_hat[1 : 1 + n_solve] = u_inner
+
+    if bc_top_is_dirichlet:
+        u_hat[Nz - 1] = u_top_hat
+
+    return u_hat
+
+@torch.jit.script
+def _pcr_solve_batched_top_neumann_one_sided(
+    rhs_hat: torch.Tensor,
+    u0_hat: torch.Tensor,
+    lam_xy: torch.Tensor,
+    dz: float,
+) -> torch.Tensor:
+    Nz = rhs_hat.size(0)
+    dz2 = dz * dz
+    n_solve = Nz - 1
+
+    u_hat = torch.zeros_like(rhs_hat)
+    u_hat[0] = u0_hat
+    if n_solve <= 0:
+        return u_hat
+
+    d = rhs_hat[1 : 1 + n_solve].clone()
+    a = torch.full_like(d, 1.0 / dz2)
+    c = torch.full_like(d, 1.0 / dz2)
+    b = (lam_xy - 2.0 / dz2).unsqueeze(0).expand(n_solve, -1, -1).clone().to(dtype=d.dtype)
+
+    d[0] = d[0] - a[0] * u0_hat
+    a[0] = 0.0
+    c[n_solve - 1] = 0.0
+
+    buf_a = torch.empty_like(d)
+    buf_b = torch.empty_like(d)
+    buf_c = torch.empty_like(d)
+    buf_d = torch.empty_like(d)
+
+    parity = 0
+    step = 1
+    while step < n_solve:
+        if parity == 0:
+            cur_a = a
+            cur_b = b
+            cur_c = c
+            cur_d = d
+            nxt_a = buf_a
+            nxt_b = buf_b
+            nxt_c = buf_c
+            nxt_d = buf_d
+        else:
+            cur_a = buf_a
+            cur_b = buf_b
+            cur_c = buf_c
+            cur_d = buf_d
+            nxt_a = a
+            nxt_b = b
+            nxt_c = c
+            nxt_d = d
+
+        alpha = cur_a[step:] / cur_b[:-step]
+        gamma = cur_c[:-step] / cur_b[step:]
+
+        nxt_a.zero_()
+        nxt_b.copy_(cur_b)
+        nxt_c.zero_()
+        nxt_d.copy_(cur_d)
+
+        nxt_a[step:] = -alpha * cur_a[:-step]
+        nxt_b[step:] -= alpha * cur_c[:-step]
+        nxt_d[step:] -= alpha * cur_d[:-step]
+
+        nxt_c[:-step] = -gamma * cur_c[step:]
+        nxt_b[:-step] -= gamma * cur_a[step:]
+        nxt_d[:-step] -= gamma * cur_d[step:]
+
+        parity = 1 - parity
+        step *= 2
+
+    if parity == 0:
+        use_b = b
+        use_d = d
+    else:
+        use_b = buf_b
+        use_d = buf_d
+
+    u_hat[1 : 1 + n_solve] = use_d / use_b
+    return u_hat
+
+@torch.jit.script
+def _thomas_solve_batched_neumann_bot_dirichlet_top(
+    rhs_hat: torch.Tensor,
+    lam_xy: torch.Tensor,
+    dz: float,
+    u_top_hat: torch.Tensor,
+) -> torch.Tensor:
+    """
+    z-Poisson with homogeneous Neumann at k=0 and Dirichlet u=u_top at k=Nz-1.
+    """
+    Nz = rhs_hat.size(0)
+    dz2 = dz * dz
+    a_val = 1.0 / dz2
+    c_val = 1.0 / dz2
+    b = lam_xy - 2.0 / dz2
+    b0 = lam_xy - 1.0 / dz2
+
+    n_solve = Nz - 1
+    u_hat = torch.zeros_like(rhs_hat)
+
+    if n_solve <= 0:
+        if Nz == 1:
+            u_hat[0] = u_top_hat
+        return u_hat
+
+    a = torch.full((n_solve,), a_val, device=rhs_hat.device, dtype=rhs_hat.dtype)
+    c = torch.full((n_solve,), c_val, device=rhs_hat.device, dtype=rhs_hat.dtype)
+    a[0] = 0.0
+
+    d = rhs_hat[0:n_solve].clone()
+    d[n_solve - 1] = d[n_solve - 1] - c[n_solve - 1] * u_top_hat
+
+    c_star = torch.zeros((n_solve,) + b.shape, device=rhs_hat.device, dtype=rhs_hat.dtype)
+    d_star = torch.zeros_like(c_star)
+
+    c_star[0] = c[0] / b0
+    d_star[0] = d[0] / b0
+
+    for k in range(1, n_solve):
+        denom = b - a[k] * c_star[k - 1]
+        if c[k] != 0.0:
+            c_star[k] = c[k] / denom
+        else:
+            c_star[k].zero_()
+        d_star[k] = (d[k] - a[k] * d_star[k - 1]) / denom
+
+    u_inner = d_star
+    for k in range(n_solve - 2, -1, -1):
+        u_inner[k] = d_star[k] - c_star[k] * u_inner[k + 1]
+
+    u_hat[0:n_solve] = u_inner
+    u_hat[Nz - 1] = u_top_hat
+    return u_hat
+
+
+@torch.jit.script
+def _thomas_solve_batched_lowmem(
+    rhs_hat: torch.Tensor,
+    u0_hat: torch.Tensor,
+    lam_xy: torch.Tensor,
+    dz: float,
+    bc_top_is_dirichlet: bool,
+    u_top_hat: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Low-memory z-direction Thomas solver for complex FFT batches.
+
+    Bottom is Dirichlet (u[0] = u0_hat). Top is either Dirichlet
+    (u[-1] = u_top_hat) or homogeneous Neumann with a mirrored ghost.
+    """
+    Nz = rhs_hat.size(0)
+    dz2 = dz * dz
+    a_val = 1.0 / dz2
+    c_val = 1.0 / dz2
+    b = (lam_xy - 2.0 / dz2).to(dtype=rhs_hat.dtype)
+
+    n_solve = Nz - 2 if bc_top_is_dirichlet else Nz - 1
+    u_hat = torch.zeros_like(rhs_hat)
+    if Nz == 0:
+        return u_hat
+    u_hat[0] = u0_hat
+    if bc_top_is_dirichlet:
+        u_hat[Nz - 1] = u_top_hat
+    if n_solve <= 0:
+        return u_hat
+
+    c_star = torch.empty((n_solve,) + b.shape, device=rhs_hat.device, dtype=rhs_hat.dtype)
+    d_star = torch.empty_like(c_star)
+
+    bottom_a = 2.0 * a_val if (n_solve == 1 and not bc_top_is_dirichlet) else a_val
+    d0 = rhs_hat[1] - bottom_a * u0_hat
+    denom0 = b
+    if n_solve == 1:
+        if bc_top_is_dirichlet:
+            d0 = d0 - c_val * u_top_hat
+            c0 = torch.zeros_like(b)
+        else:
+            c0 = torch.zeros_like(b)
+        c_star[0] = c0
+        d_star[0] = d0 / denom0
+    else:
+        c_star[0] = c_val / denom0
+        d_star[0] = d0 / denom0
+
+        for i in range(1, n_solve):
+            rhs_idx = i + 1
+            d = rhs_hat[rhs_idx]
+            a_eff = a_val
+            c_eff = c_val
+            b_eff = b
+
+            if i == n_solve - 1:
+                if bc_top_is_dirichlet:
+                    d = d - c_val * u_top_hat
+                    c_eff = 0.0
+                else:
+                    a_eff = 2.0 * a_val
+                    c_eff = 0.0
+
+            denom = b_eff - a_eff * c_star[i - 1]
+            c_star[i] = c_eff / denom
+            d_star[i] = (d - a_eff * d_star[i - 1]) / denom
+
+    u_inner = d_star
+    for i in range(n_solve - 2, -1, -1):
+        u_inner[i] = d_star[i] - c_star[i] * u_inner[i + 1]
+
+    u_hat[1 : 1 + n_solve] = u_inner
+    return u_hat
+
+
+@torch.jit.script
+def _pentadiag_solve_batched(
+    rhs: torch.Tensor,
+    u0_hat: torch.Tensor,
+    lam_xy: torch.Tensor,
+    dz: float,
+    bc_top_is_dirichlet: bool,
+    u_top_hat: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Batched pentadiagonal solver for z direction.
+    """
+    Nz = rhs.size(0)
+    dz2 = dz * dz
+
+    u_hat = torch.zeros_like(rhs)
+    if Nz == 0:
+        return u_hat
+
+    u_hat[0] = u0_hat
+    if bc_top_is_dirichlet and Nz > 1:
+        u_hat[Nz - 1] = u_top_hat
+
+    n = Nz - 2 if bc_top_is_dirichlet else Nz - 1
+    if n <= 0:
+        return u_hat
+
+    a2_int = -1.0 / (12.0 * dz2)
+    a1_int = 16.0 / (12.0 * dz2)
+    diag_int = lam_xy - 30.0 / (12.0 * dz2)
+    d1_int = a1_int
+    d2_int = a2_int
+
+    a1_2 = 1.0 / dz2
+    diag_2 = lam_xy - 2.0 / dz2
+    a1_neu_top = 2.0 / dz2
+    diag_neu_top = lam_xy - 2.0 / dz2
+
+    f = rhs[1 : 1 + n].clone()
+
+    f[0] = f[0] - a1_2 * u0_hat
+    if n >= 2 and Nz >= 4:
+        f[1] = f[1] - a2_int * u0_hat
+
+    if bc_top_is_dirichlet and Nz >= 3:
+        f[n - 1] = f[n - 1] - a1_2 * u_top_hat
+        if n >= 2 and Nz >= 5:
+            f[n - 2] = f[n - 2] - d2_int * u_top_hat
+
+    d_mod = torch.empty((n,) + lam_xy.shape, device=rhs.device, dtype=rhs.dtype)
+    e_mod = torch.empty_like(d_mod)
+
+    for i in range(n):
+        a2 = a2_int
+        a1 = a1_int
+        c = diag_int
+        d1 = d1_int
+        e2 = d2_int
+
+        if i == 0:
+            a2 = 0.0
+            a1 = a1_2
+            c = diag_2
+            d1 = a1_2
+            e2 = 0.0
+
+        if bc_top_is_dirichlet:
+            if i == n - 1:
+                a2 = 0.0
+                a1 = a1_2
+                c = diag_2
+                d1 = 0.0
+                e2 = 0.0
+            elif i == n - 2 and n >= 2:
+                a2 = 0.0
+                a1 = a1_2
+                c = diag_2
+                d1 = a1_2
+                e2 = 0.0
+        else:
+            if i == n - 1:
+                a2 = 0.0
+                a1 = a1_neu_top
+                c = diag_neu_top
+                d1 = 0.0
+                e2 = 0.0
+            elif i == n - 2 and n >= 2:
+                a2 = 0.0
+                a1 = a1_2
+                c = diag_2
+                d1 = a1_2
+                e2 = 0.0
+
+        if i == 0:
+            denom = c
+            d_mod[0] = d1 / denom
+            e_mod[0] = e2 / denom
+            f[0] = f[0] / denom
+        elif i == 1:
+            denom = c - a1 * d_mod[0]
+            d_mod[1] = (d1 - a1 * e_mod[0]) / denom
+            e_mod[1] = e2 / denom
+            f[1] = (f[1] - a1 * f[0]) / denom
+        else:
+            bprime = a1 - a2 * d_mod[i - 2]
+            denom = c - a2 * e_mod[i - 2] - bprime * d_mod[i - 1]
+            d_mod[i] = (d1 - bprime * e_mod[i - 1]) / denom
+            e_mod[i] = e2 / denom
+            f[i] = (f[i] - a2 * f[i - 2] - bprime * f[i - 1]) / denom
+
+    u_inner = u_hat[1 : 1 + n]
+    u_inner[n - 1] = f[n - 1]
+    if n >= 2:
+        u_inner[n - 2] = f[n - 2] - d_mod[n - 2] * u_inner[n - 1]
+    for i in range(n - 3, -1, -1):
+        u_inner[i] = f[i] - d_mod[i] * u_inner[i + 1] - e_mod[i] * u_inner[i + 2]
+    return u_hat
+
+
+class NFPTSolverGPU:
+    """
+    NFPT (Non-variational FFF in Poloidal-Toroidal formulation) GPU Solver.
+    [Upgraded] Features Background Field Subtraction and Single-Polarity Alpha Injection.
+    """
+
+    def __init__(
+        self,
+        Nx,
+        Ny,
+        Nz,
+        dx,
+        dy,
+        dz,
+        device="cuda",
+        *,
+        buffer_thickness: Optional[int] = None,
+        pin_potential_boundaries: bool = False,
+        lateral_wall: LateralWallMode = "paper_bc1",
+        padded_buffer_zone: bool = True,
+        pad_calculation_domain: Optional[bool] = True,
+        calculation_domain_mode: CalculationDomainMode = "mudpack",
+        buffer_xy_only: bool = False,
+        rhs_lap_xy: RhsLapXyMode = "fd",
+        rhs_lap_xy_spectral_ext: SpectralLapExtBc = "neumann",
+        rhs_jz_div_chain: bool = False,
+        lap_phi_z_boundary_mean: bool = False,
+        finite_difference_order: int = 2,
+        poisson_xy_order: Optional[int] = None,
+        poisson_z_order: int = 2,
+        poisson_z_backend: PoissonZBackend = "thomas",
+        poisson_2d_interior_rhs_only: bool = False,
+        poisson_2d_endpoint_dirichlet: bool = True,
+        poisson_3d_endpoint_neumann_xy: bool = False,
+        poisson_3d_top_neumann_one_sided: bool = False,
+        poisson_mudpack_like: bool = True,
+        fortran_bjt00: Optional[bool] = None,
+        fortran_phi_total_solve: Optional[bool] = None,
+        fortran_iphiws3_potential: Optional[bool] = None,
+        dtype: torch.dtype = torch.float64,
+    ):
+        input_Nx, input_Ny, input_Nz = int(Nx), int(Ny), int(Nz)
+        if buffer_thickness is None:
+            resolved_buffer_thickness = 0
+        else:
+            resolved_buffer_thickness = int(buffer_thickness)
+        use_padded_buffer_zone = bool(padded_buffer_zone)
+        if pad_calculation_domain is None:
+            pad_calculation_domain = use_padded_buffer_zone
+        use_calculation_pad = bool(pad_calculation_domain)
+        calculation_mode = str(calculation_domain_mode).lower().replace("-", "_")
+        if calculation_mode not in ("mudpack", "mudpack_legacy", "bottom_padding"):
+            raise ValueError(
+                "calculation_domain_mode must be 'mudpack', 'mudpack_legacy', or "
+                f"'bottom_padding'; got {calculation_domain_mode!r}"
+            )
+        if use_calculation_pad:
+            if calculation_mode in ("mudpack", "mudpack_legacy"):
+                # mudpack: equal left/right (and y) pads for mirror-symmetric FOVs.
+                # mudpack_legacy: exact Fortran (nx-nxo)//2 placement (odd rem on +side).
+                fgrid = nfpt_fortran_grid(
+                    input_Nx,
+                    input_Ny,
+                    input_Nz,
+                    symmetric_xy=(calculation_mode == "mudpack"),
+                )
+                calc_Nx, calc_Ny, calc_Nz = fgrid.nx, fgrid.ny, fgrid.nz
+                calculation_pad_xy = (fgrid.bfx, fgrid.bfy)
+            else:
+                bottom_pad = (input_Nx + input_Ny) // 6
+                calc_Nx = input_Nx + 2 * bottom_pad
+                calc_Ny = input_Ny + 2 * bottom_pad
+                calc_Nz = min(calc_Nx, calc_Ny)
+                if calc_Nz < input_Nz:
+                    raise ValueError(
+                        "bottom_padding calculation height cannot contain the input z domain: "
+                        f"input_Nz={input_Nz}, calculated Nz={calc_Nz}"
+                    )
+                calculation_pad_xy = (bottom_pad, bottom_pad)
+        else:
+            calc_Nx, calc_Ny, calc_Nz = input_Nx, input_Ny, input_Nz
+            calculation_pad_xy = (0, 0)
+
+        self._input_shape_zyx = (input_Nz, input_Ny, input_Nx)
+        self._auto_padded_calculation_domain = use_calculation_pad and (
+            calc_Nx, calc_Ny, calc_Nz
+        ) != (input_Nx, input_Ny, input_Nz)
+        self._calculation_domain_mode = calculation_mode
+        self._calculation_pad_xy = calculation_pad_xy
+        self.Nx, self.Ny, self.Nz = calc_Nx, calc_Ny, calc_Nz
+        self.dx, self.dy, self.dz = dx, dy, dz
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.dtype = dtype
+
+        fdo = int(finite_difference_order)
+        if fdo not in (2, 4):
+            raise ValueError("finite_difference_order must be 2 or 4")
+        self._finite_difference_order = fdo
+
+        pzo = int(poisson_z_order)
+        if pzo not in (2, 4):
+            raise ValueError("poisson_z_order must be 2 or 4")
+        self._poisson_z_order = pzo
+
+        pzb = str(poisson_z_backend).lower()
+        if pzb not in ("thomas", "pcr"):
+            raise ValueError("poisson_z_backend must be 'thomas' or 'pcr'")
+        self._poisson_z_backend: PoissonZBackend = pzb
+
+        pxo = pzo if poisson_xy_order is None else int(poisson_xy_order)
+        if pxo not in (2, 4):
+            raise ValueError("poisson_xy_order must be 2 or 4")
+        self._poisson_xy_order = pxo
+
+        lw = str(lateral_wall).lower().replace("-", "_")
+        if lw in ("bc1", "paper_bc1", "paper"):
+            self._lateral_wall = "BC1"
+        elif lw in ("potential_pin", "legacy_potential_pin", "potentialpin", "pin", "legacy"):
+            self._lateral_wall = "potential_pin"
+        else:
+            raise ValueError(
+                "lateral_wall must be one of: 'potential_pin', 'legacy_potential_pin', "
+                f"'BC1', 'paper_bc1', 'paper'; got {lateral_wall!r}"
+            )
+
+        kx_freq = torch.fft.rfftfreq(2 * self.Nx, d=1.0, device=self.device).to(dtype=self.dtype)
+        ky_freq = torch.fft.fftfreq(2 * self.Ny, d=1.0, device=self.device).to(dtype=self.dtype)
+
+        cos_kx = torch.cos(2 * torch.pi * kx_freq)
+        cos_ky = torch.cos(2 * torch.pi * ky_freq)
+        if self._poisson_xy_order == 2:
+            lam_x = (2.0 * cos_kx - 2.0) / (dx**2)
+            lam_y = (2.0 * cos_ky - 2.0) / (dy**2)
+        else:
+            cos_2kx = torch.cos(4 * torch.pi * kx_freq)
+            cos_2ky = torch.cos(4 * torch.pi * ky_freq)
+            lam_x = (1.0 / (12.0 * dx**2)) * (-2.0 * cos_2kx + 32.0 * cos_kx - 30.0)
+            lam_y = (1.0 / (12.0 * dy**2)) * (-2.0 * cos_2ky + 32.0 * cos_ky - 30.0)
+
+        Lam_y, Lam_x = torch.meshgrid(lam_y, lam_x, indexing="ij")
+        self.lam_xy = Lam_x + Lam_y
+
+        self.lam_xy_safe = self.lam_xy.clone()
+        self.lam_xy_safe[0, 0] = -1.0
+
+        self.Bz_obs = None
+        self.Jz_obs = None
+        self.Bx_obs = None
+        self.By_obs = None
+        self.Phi_bottom = None
+        self.Phi_pot = None
+        self.Az_bottom = None
+        self.B_pot = None
+        
+        self._pin_potential_boundaries = bool(pin_potential_boundaries)
+        if self._lateral_wall == "BC1" and self._pin_potential_boundaries:
+            warnings.warn(
+                "lateral_wall is BC1 (paper-aligned): lateral and top B follow rigid-wall "
+                "and source-surface conditions; pin_potential_boundaries=True does not pin B "
+                "to B_pot on those faces. Set pin_potential_boundaries=False when comparing "
+                "to the NFPT paper.",
+                UserWarning,
+                stacklevel=2,
+            )
+            
+        self._bc1_p1: Optional[torch.Tensor] = None
+        self._padded_buffer_zone = use_padded_buffer_zone
+        self._buffer_xy_only = bool(buffer_xy_only)
+
+        self.buffer_thickness = resolved_buffer_thickness
+        self.buffer_window = None
+        
+        rl = str(rhs_lap_xy).lower()
+        if rl not in ("fd", "spectral"):
+            raise ValueError("rhs_lap_xy must be 'fd' or 'spectral'")
+        self._rhs_lap_xy: RhsLapXyMode = rl
+        
+        se = str(rhs_lap_xy_spectral_ext).lower()
+        if se not in ("neumann", "dirichlet"):
+            raise ValueError("rhs_lap_xy_spectral_ext must be 'neumann' or 'dirichlet'")
+        self._rhs_lap_xy_spectral_ext: SpectralLapExtBc = se
+        
+        self._rhs_jz_div_chain = bool(rhs_jz_div_chain)
+        self._lap_phi_z_boundary_mean = bool(lap_phi_z_boundary_mean)
+        self._poisson_2d_interior_rhs_only = bool(poisson_2d_interior_rhs_only)
+        self._poisson_2d_endpoint_dirichlet = bool(poisson_2d_endpoint_dirichlet)
+        self._poisson_3d_endpoint_neumann_xy = bool(poisson_3d_endpoint_neumann_xy)
+        self._poisson_3d_top_neumann_one_sided = bool(poisson_3d_top_neumann_one_sided)
+        self._poisson_mudpack_like = bool(poisson_mudpack_like)
+        self._fortran_bjt00 = self._poisson_mudpack_like if fortran_bjt00 is None else bool(fortran_bjt00)
+        self._fortran_phi_total_solve = False if fortran_phi_total_solve is None else bool(fortran_phi_total_solve)
+        self._fortran_iphiws3_potential = (
+            self._poisson_mudpack_like if fortran_iphiws3_potential is None else bool(fortran_iphiws3_potential)
+        )
+        self.fov_slice_yx = None
+
+        self._B = None
+        self._J = None
+        self._Phi_c = None  # Using _Phi_c to denote Current-induced Poloidal Scalar
+        self._Az = None
+        self._init_diagnostics = None
+        self._last_auto_rbsl_insert_diagnostics = None
+        self._observed_shape_zyx: Optional[tuple[int, int, int]] = None
+        self._zeros_xy_cache: Optional[torch.Tensor] = None
+        self._dirichlet_lam_xy_cache: Optional[torch.Tensor] = None
+        self._endpoint_neumann_lam_xy_cache: Optional[torch.Tensor] = None
+        self._endpoint_neumann_lam_xy_safe_cache: Optional[torch.Tensor] = None
+        self._boundary_hat_cache: dict[tuple[str, str, str], torch.Tensor] = {}
+
+    # =================================================================
+    # Even / odd extension  (DCT / DST via mirroring + standard FFT)
+    # =================================================================
+    def _extend_xy(self, x, bc):
+        """(..., Ny, Nx) -> (..., 2Ny, 2Nx)"""
+        ny = x.size(-2)
+        nx = x.size(-1)
+        out_shape = x.shape[:-2] + (2 * ny, 2 * nx)
+        out = torch.empty(out_shape, device=x.device, dtype=x.dtype)
+        out[..., :ny, :nx] = x
+        if bc == "neumann":
+            out[..., :ny, nx:] = x.flip(-1)
+            out[..., ny:, :nx] = x.flip(-2)
+            out[..., ny:, nx:] = x.flip((-2, -1))
+        else:
+            out[..., :ny, nx:] = x.flip(-1)
+            out[..., :ny, nx:].neg_()
+            out[..., ny:, :nx] = x.flip(-2)
+            out[..., ny:, :nx].neg_()
+            out[..., ny:, nx:] = x.flip((-2, -1))
+        return out
+
+    def _extract_xy(self, x):
+        return x[..., : self.Ny, : self.Nx]
+
+    def _zeros_xy(self) -> torch.Tensor:
+        cached = self._zeros_xy_cache
+        if cached is None:
+            cached = torch.zeros(self.Ny, self.Nx, device=self.device, dtype=self.dtype)
+            self._zeros_xy_cache = cached
+        return cached
+
+    def _reset_boundary_hat_cache(self) -> None:
+        self._boundary_hat_cache.clear()
+
+    def _fixed_boundary_role(self, value: torch.Tensor) -> Optional[str]:
+        if value is self._zeros_xy_cache:
+            return "zero"
+        if self.Bz_obs is not None and value is self.Bz_obs:
+            return "bz_obs"
+        if self.Jz_obs is not None and value is self.Jz_obs:
+            return "jz_obs"
+        if self.Az_bottom is not None and value is self.Az_bottom:
+            return "az_bottom"
+        return None
+
+    def _cached_boundary_hat_fft2(self, value: torch.Tensor, bc_xy: str) -> torch.Tensor:
+        role = self._fixed_boundary_role(value)
+        key = ("fft2", bc_xy, role) if role is not None else None
+        if key is not None and key in self._boundary_hat_cache:
+            return self._boundary_hat_cache[key]
+        ext = self._extend_xy(value.unsqueeze(0), bc_xy)
+        hat = torch.fft.rfft2(ext, dim=(1, 2)).squeeze(0)
+        if key is not None:
+            self._boundary_hat_cache[key] = hat
+        return hat
+
+    def _cached_boundary_hat_dct(self, value: torch.Tensor) -> torch.Tensor:
+        role = self._fixed_boundary_role(value)
+        key = ("dct", "endpoint", role) if role is not None else None
+        if key is not None and key in self._boundary_hat_cache:
+            return self._boundary_hat_cache[key]
+        hat = self._dct1(self._dct1(value, -1), -2)
+        if key is not None:
+            self._boundary_hat_cache[key] = hat
+        return hat
+
+    def _cached_boundary_hat_dst_interior(self, value: torch.Tensor) -> torch.Tensor:
+        role = self._fixed_boundary_role(value)
+        key = ("dst", "interior", role) if role is not None else None
+        if key is not None and key in self._boundary_hat_cache:
+            return self._boundary_hat_cache[key]
+        hat = self._dst1(self._dst1(value[1:-1, 1:-1], -1), -2)
+        if key is not None:
+            self._boundary_hat_cache[key] = hat
+        return hat
+
+    # =================================================================
+    # 2-D Poisson  (spectral in x, y)
+    # =================================================================
+    @staticmethod
+    def _dst1(x: torch.Tensor, dim: int) -> torch.Tensor:
+        n = x.size(dim)
+        y_shape = list(x.shape)
+        y_shape[dim] = 2 * (n + 1)
+        y = torch.empty(y_shape, device=x.device, dtype=x.dtype)
+
+        idx_start = [slice(None)] * x.ndim
+        idx_start[dim] = 0
+        y[tuple(idx_start)] = 0.0
+
+        idx_pos = [slice(None)] * x.ndim
+        idx_pos[dim] = slice(1, n + 1)
+        y[tuple(idx_pos)] = x
+
+        idx_mid = [slice(None)] * x.ndim
+        idx_mid[dim] = n + 1
+        y[tuple(idx_mid)] = 0.0
+
+        idx_neg = [slice(None)] * x.ndim
+        idx_neg[dim] = slice(n + 2, None)
+        y[tuple(idx_neg)] = -torch.flip(x, dims=(dim,))
+
+        Y = torch.fft.rfft(y, dim=dim)
+        idx_out = [slice(None)] * x.ndim
+        idx_out[dim] = slice(1, n + 1)
+        return -Y.imag[tuple(idx_out)]
+
+    @classmethod
+    def _idst1(cls, X: torch.Tensor, dim: int) -> torch.Tensor:
+        n = X.size(dim)
+        return cls._dst1(X, dim) / (2.0 * (n + 1))
+
+    @staticmethod
+    def _dct1(x: torch.Tensor, dim: int) -> torch.Tensor:
+        n = x.size(dim)
+        if n == 1:
+            return x.clone()
+        y_shape = list(x.shape)
+        y_shape[dim] = 2 * (n - 1)
+        y = torch.empty(y_shape, device=x.device, dtype=x.dtype)
+
+        idx_front = [slice(None)] * x.ndim
+        idx_front[dim] = slice(0, n)
+        y[tuple(idx_front)] = x
+
+        idx_back = [slice(None)] * x.ndim
+        idx_back[dim] = slice(n, None)
+        idx_inner = [slice(None)] * x.ndim
+        idx_inner[dim] = slice(1, n - 1)
+        y[tuple(idx_back)] = torch.flip(x[tuple(idx_inner)], dims=(dim,))
+
+        Y = torch.fft.rfft(y, dim=dim)
+        idx_out = [slice(None)] * x.ndim
+        idx_out[dim] = slice(0, n)
+        return Y.real[tuple(idx_out)]
+
+    @classmethod
+    def _idct1(cls, X: torch.Tensor, dim: int) -> torch.Tensor:
+        n = X.size(dim)
+        if n == 1:
+            return X.clone()
+        return cls._dct1(X, dim) / (2.0 * (n - 1))
+
+    def _dirichlet_lam_xy_interior(self) -> torch.Tensor:
+        cached = self._dirichlet_lam_xy_cache
+        if cached is not None:
+            return cached
+        nx_i = self.Nx - 2
+        ny_i = self.Ny - 2
+        kx = torch.arange(1, nx_i + 1, device=self.device, dtype=self.dtype)
+        ky = torch.arange(1, ny_i + 1, device=self.device, dtype=self.dtype)
+        lam_x = -4.0 * torch.sin(torch.pi * kx / (2.0 * (nx_i + 1))) ** 2 / (self.dx**2)
+        lam_y = -4.0 * torch.sin(torch.pi * ky / (2.0 * (ny_i + 1))) ** 2 / (self.dy**2)
+        Lam_y, Lam_x = torch.meshgrid(lam_y, lam_x, indexing="ij")
+        cached = Lam_x + Lam_y
+        self._dirichlet_lam_xy_cache = cached
+        return cached
+
+    def _endpoint_neumann_lam_xy(self) -> torch.Tensor:
+        cached = self._endpoint_neumann_lam_xy_cache
+        if cached is not None:
+            return cached
+        kx = torch.arange(0, self.Nx, device=self.device, dtype=self.dtype)
+        ky = torch.arange(0, self.Ny, device=self.device, dtype=self.dtype)
+        lam_x = -4.0 * torch.sin(torch.pi * kx / (2.0 * max(self.Nx - 1, 1))) ** 2 / (self.dx**2)
+        lam_y = -4.0 * torch.sin(torch.pi * ky / (2.0 * max(self.Ny - 1, 1))) ** 2 / (self.dy**2)
+        Lam_y, Lam_x = torch.meshgrid(lam_y, lam_x, indexing="ij")
+        cached = Lam_x + Lam_y
+        self._endpoint_neumann_lam_xy_cache = cached
+        return cached
+
+    def _endpoint_neumann_lam_xy_safe(self) -> torch.Tensor:
+        cached = self._endpoint_neumann_lam_xy_safe_cache
+        if cached is not None:
+            return cached
+        cached = self._endpoint_neumann_lam_xy().clone()
+        cached[0, 0] = 1.0
+        self._endpoint_neumann_lam_xy_safe_cache = cached
+        return cached
+
+    def _solve_poisson_2d_skip_bottom(
+        self,
+        source: torch.Tensor,
+        bc: str,
+        bottom: torch.Tensor,
+    ) -> torch.Tensor:
+        out = torch.empty_like(source)
+        out[0] = bottom
+        if source.size(0) > 1:
+            out[1:] = self._solve_poisson_2d(source[1:], bc)
+        return out
+
+    def _solve_poisson_2d_endpoint_dirichlet(self, source: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros_like(source)
+        if self.Nx < 3 or self.Ny < 3:
+            return out
+
+        rhs = source[..., 1:-1, 1:-1]
+        rhs_hat = self._dst1(self._dst1(rhs, -1), -2)
+
+        rhs_hat.div_(self._dirichlet_lam_xy_interior().to(dtype=rhs_hat.dtype))
+        tmp = self._idst1(rhs_hat, -1)
+        del rhs_hat
+        out[..., 1:-1, 1:-1] = self._idst1(tmp, -2)
+        return out
+
+    def _solve_poisson_2d_endpoint_neumann(
+        self,
+        source: torch.Tensor,
+        *,
+        gx_left: Optional[torch.Tensor] = None,
+        gx_right: Optional[torch.Tensor] = None,
+        gy_bottom: Optional[torch.Tensor] = None,
+        gy_top: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        MUDPACK-style endpoint Neumann solve for ∇²u = source.
+
+        The endpoint rows use the ghost-cell elimination used by mud2sp:
+        left/right rows get doubled neighbor coefficients and RHS corrections
+        +/- 2 g / h for derivative boundary data. The singular constant mode
+        is fixed to zero, matching the existing spectral gauge convention.
+        """
+        rhs = source.clone()
+        if gx_left is not None:
+            rhs[..., :, 0] = rhs[..., :, 0] + (2.0 / self.dx) * gx_left
+        if gx_right is not None:
+            rhs[..., :, -1] = rhs[..., :, -1] - (2.0 / self.dx) * gx_right
+        if gy_bottom is not None:
+            rhs[..., 0, :] = rhs[..., 0, :] + (2.0 / self.dy) * gy_bottom
+        if gy_top is not None:
+            rhs[..., -1, :] = rhs[..., -1, :] - (2.0 / self.dy) * gy_top
+
+        rhs_hat = self._dct1(self._dct1(rhs, -1), -2)
+        del rhs
+        rhs_hat.div_(self._endpoint_neumann_lam_xy_safe().to(dtype=rhs_hat.dtype))
+        rhs_hat[..., 0, 0] = 0.0
+        tmp = self._idct1(rhs_hat, -1)
+        del rhs_hat
+        return self._idct1(tmp, -2)
+
+    def _bc1_phi_neumann_maps(self, source: torch.Tensor):
+        p1 = self._bc1_p1
+        if p1 is None:
+            return None, None, None, None
+        p1 = p1.to(device=self.device, dtype=self.dtype)
+        batch_shape = source.shape[:-2]
+        gx_shape = batch_shape + (self.Ny,)
+        gy_shape = batch_shape + (self.Nx,)
+        gx_left = -p1 * torch.ones(gx_shape, device=self.device, dtype=self.dtype)
+        gx_right = p1 * torch.ones(gx_shape, device=self.device, dtype=self.dtype)
+        gy_bottom = -p1 * torch.ones(gy_shape, device=self.device, dtype=self.dtype)
+        gy_top = p1 * torch.ones(gy_shape, device=self.device, dtype=self.dtype)
+        return gx_left, gx_right, gy_bottom, gy_top
+
+    def _solve_phi_neumann_with_bc1_flux(self, source: torch.Tensor) -> torch.Tensor:
+        if self._poisson_mudpack_like:
+            gx_left, gx_right, gy_bottom, gy_top = self._bc1_phi_neumann_maps(source)
+            return self._solve_poisson_2d_endpoint_neumann(
+                source,
+                gx_left=gx_left,
+                gx_right=gx_right,
+                gy_bottom=gy_bottom,
+                gy_top=gy_top,
+            )
+
+        if self._bc1_p1 is None:
+            return self._solve_poisson_2d(source, "neumann")
+
+        half_x = 0.5 * float(self.Nx - 1) * float(self.dx)
+        half_y = 0.5 * float(self.Ny - 1) * float(self.dy)
+        if half_x == 0.0 or half_y == 0.0:
+            return self._solve_poisson_2d(source, "neumann")
+
+        x = (torch.arange(self.Nx, device=self.device, dtype=self.dtype) * self.dx - half_x).view(1, 1, self.Nx)
+        y = (torch.arange(self.Ny, device=self.device, dtype=self.dtype) * self.dy - half_y).view(1, self.Ny, 1)
+        p1 = self._bc1_p1.to(device=self.device, dtype=self.dtype)
+        q = p1 * (x * x / (2.0 * half_x) + y * y / (2.0 * half_y))
+        lap_q = p1 * (1.0 / half_x + 1.0 / half_y)
+        return self._solve_poisson_2d(source - lap_q, "neumann") + q
+
+    def _solve_poisson_2d(self, source, bc):
+        if self._poisson_mudpack_like:
+            if bc == "dirichlet":
+                return self._solve_poisson_2d_endpoint_dirichlet(source)
+            if bc == "neumann":
+                return self._solve_poisson_2d_endpoint_neumann(source)
+        if bc == "dirichlet" and self._poisson_2d_endpoint_dirichlet:
+            return self._solve_poisson_2d_endpoint_dirichlet(source)
+        if self._poisson_2d_interior_rhs_only:
+            source = source.clone()
+            source[..., 0, :] = 0.0
+            source[..., -1, :] = 0.0
+            source[..., :, 0] = 0.0
+            source[..., :, -1] = 0.0
+        src_ext = self._extend_xy(source, bc)
+        src_hat = torch.fft.rfft2(src_ext, dim=(-2, -1))
+        del src_ext
+        src_hat.div_(self.lam_xy_safe)
+        src_hat[..., 0, 0] = 0.0
+        u = torch.fft.irfft2(src_hat, s=(2 * self.Ny, 2 * self.Nx), dim=(-2, -1))
+        return self._extract_xy(u)
+
+    # =================================================================
+    # Batch PCR algorithm  (z-direction parallel solve)
+    # =================================================================
+    def _thomas_solve(self, rhs_hat, u0_hat, bc_top, u_top_hat=None):
+        use_penta = getattr(self, "_poisson_z_order", 2) == 4
+        if bc_top == "dirichlet":
+            if u_top_hat is None:
+                u_top_hat = torch.zeros_like(u0_hat)
+            if use_penta:
+                return _pentadiag_solve_batched(rhs_hat, u0_hat, self.lam_xy, float(self.dz), True, u_top_hat)
+            if self._poisson_z_backend == "pcr":
+                return _pcr_solve_batched(rhs_hat, u0_hat, self.lam_xy, float(self.dz), True, u_top_hat)
+            return _thomas_solve_batched_lowmem(rhs_hat, u0_hat, self.lam_xy, float(self.dz), True, u_top_hat)
+
+        dummy = torch.zeros_like(u0_hat) if u_top_hat is None else u_top_hat
+        if self._poisson_3d_top_neumann_one_sided and not use_penta and self._poisson_z_backend == "pcr":
+            return _pcr_solve_batched_top_neumann_one_sided(rhs_hat, u0_hat, self.lam_xy, float(self.dz))
+        if use_penta:
+            return _pentadiag_solve_batched(rhs_hat, u0_hat, self.lam_xy, float(self.dz), False, dummy)
+        if self._poisson_z_backend == "pcr":
+            return _pcr_solve_batched(rhs_hat, u0_hat, self.lam_xy, float(self.dz), False, dummy)
+        return _thomas_solve_batched_lowmem(rhs_hat, u0_hat, self.lam_xy, float(self.dz), False, dummy)
+
+    # =================================================================
+    # 3-D Poisson  (spectral x,y  +  tridiag z)
+    # =================================================================
+    def _solve_poisson_3d_endpoint_neumann_xy(self, source, bottom_val, bc_top, top_val=None):
+        src_hat = self._dct1(self._dct1(source, -1), -2)
+        bot_hat = self._cached_boundary_hat_dct(bottom_val)
+
+        top_hat = None
+        if top_val is not None:
+            top_hat = self._cached_boundary_hat_dct(top_val)
+
+        lam_xy = self._endpoint_neumann_lam_xy()
+
+        dummy = torch.zeros_like(bot_hat) if top_hat is None else top_hat
+        u_hat = _pcr_solve_batched(src_hat, bot_hat, lam_xy, float(self.dz), bc_top == "dirichlet", dummy)
+        del src_hat
+        tmp = self._idct1(u_hat, -1)
+        del u_hat
+        return self._idct1(tmp, -2)
+
+    def _solve_poisson_3d_mudpack_neumann_xy(self, source, bottom_val, bc_top, top_val=None):
+        src_hat = self._dct1(self._dct1(source, -1), -2)
+        bot_hat = self._cached_boundary_hat_dct(bottom_val)
+        top_hat = None
+        if top_val is not None:
+            top_hat = self._cached_boundary_hat_dct(top_val)
+
+        lam_xy = self._endpoint_neumann_lam_xy()
+
+        dummy = torch.zeros_like(bot_hat) if top_hat is None else top_hat
+        if self._poisson_z_backend == "pcr":
+            u_hat = _pcr_solve_batched(src_hat, bot_hat, lam_xy, float(self.dz), bc_top == "dirichlet", dummy)
+        else:
+            u_hat = _thomas_solve_batched_lowmem(src_hat, bot_hat, lam_xy, float(self.dz), bc_top == "dirichlet", dummy)
+        del src_hat
+        tmp = self._idct1(u_hat, -1)
+        del u_hat
+        return self._idct1(tmp, -2)
+
+    def _solve_poisson_3d_mudpack_dirichlet_xy(self, source, bottom_val, bc_top, top_val=None):
+        out = torch.zeros_like(source)
+        out[0] = bottom_val
+        if top_val is None:
+            top_val = self._zeros_xy()
+        if bc_top == "dirichlet":
+            out[-1] = top_val
+        if self.Nx < 3 or self.Ny < 3:
+            return out
+
+        rhs = source[:, 1:-1, 1:-1]
+        src_hat = self._dst1(self._dst1(rhs, -1), -2)
+        bot_hat = self._cached_boundary_hat_dst_interior(bottom_val)
+        top_hat = self._cached_boundary_hat_dst_interior(top_val)
+
+        lam_xy = self._dirichlet_lam_xy_interior()
+
+        if self._poisson_z_backend == "pcr":
+            u_hat = _pcr_solve_batched(src_hat, bot_hat, lam_xy, float(self.dz), bc_top == "dirichlet", top_hat)
+        else:
+            u_hat = _thomas_solve_batched_lowmem(src_hat, bot_hat, lam_xy, float(self.dz), bc_top == "dirichlet", top_hat)
+        del src_hat
+        tmp = self._idst1(u_hat, -1)
+        del u_hat
+        out[:, 1:-1, 1:-1] = self._idst1(tmp, -2)
+        out[0] = bottom_val
+        if bc_top == "dirichlet":
+            out[-1] = top_val
+        return out
+
+    def _solve_poisson_3d(self, source, bc_xy, bottom_val, bc_top, top_val=None):
+        if self._poisson_mudpack_like:
+            if bc_xy == "neumann":
+                return self._solve_poisson_3d_mudpack_neumann_xy(source, bottom_val, bc_top, top_val)
+            if bc_xy == "dirichlet":
+                return self._solve_poisson_3d_mudpack_dirichlet_xy(source, bottom_val, bc_top, top_val)
+        if bc_xy == "neumann" and self._poisson_3d_endpoint_neumann_xy:
+            return self._solve_poisson_3d_endpoint_neumann_xy(source, bottom_val, bc_top, top_val)
+
+        src_ext = self._extend_xy(source, bc_xy)
+        src_hat = torch.fft.rfft2(src_ext, dim=(1, 2))
+        del src_ext
+        bot_hat = self._cached_boundary_hat_fft2(bottom_val, bc_xy)
+
+        top_hat = None
+        if top_val is not None:
+            top_hat = self._cached_boundary_hat_fft2(top_val, bc_xy)
+
+        u_hat = self._thomas_solve(src_hat, bot_hat, bc_top, top_hat)
+        del src_hat
+        u = torch.fft.irfft2(u_hat, s=(2 * self.Ny, 2 * self.Nx), dim=(1, 2))
+        return self._extract_xy(u)
+
+    # =================================================================
+    # Finite-difference operators
+    # =================================================================
+    def _d_dx_centered(self, f: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros_like(f)
+        nx = f.size(2)
+        if nx < 2: return out
+        if self._finite_difference_order == 2 or nx < 5:
+            if nx >= 3:
+                out[..., 1:-1] = (f[..., 2:] - f[..., :-2]) / (2.0 * self.dx)
+                out[..., 0] = (-3.0 * f[..., 0] + 4.0 * f[..., 1] - f[..., 2]) / (2.0 * self.dx)
+                out[..., -1] = (3.0 * f[..., -1] - 4.0 * f[..., -2] + f[..., -3]) / (2.0 * self.dx)
+            else:
+                out[..., 0] = (f[..., 1] - f[..., 0]) / self.dx
+                out[..., -1] = (f[..., -1] - f[..., -2]) / self.dx
+            return out
+        out[..., 2:-2] = (-f[..., 4:] + 8.0 * f[..., 3:-1] - 8.0 * f[..., 1:-3] + f[..., :-4]) / (12.0 * self.dx)
+        out[..., 1] = (f[..., 2] - f[..., 0]) / (2.0 * self.dx)
+        out[..., -2] = (f[..., -1] - f[..., -3]) / (2.0 * self.dx)
+        out[..., 0] = (-3.0 * f[..., 0] + 4.0 * f[..., 1] - f[..., 2]) / (2.0 * self.dx)
+        out[..., -1] = (3.0 * f[..., -1] - 4.0 * f[..., -2] + f[..., -3]) / (2.0 * self.dx)
+        return out
+
+    def _d_dy_centered(self, f: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros_like(f)
+        ny = f.size(1)
+        if ny < 2: return out
+        if self._finite_difference_order == 2 or ny < 5:
+            if ny >= 3:
+                out[:, 1:-1, :] = (f[:, 2:, :] - f[:, :-2, :]) / (2.0 * self.dy)
+                out[:, 0, :] = (-3.0 * f[:, 0, :] + 4.0 * f[:, 1, :] - f[:, 2, :]) / (2.0 * self.dy)
+                out[:, -1, :] = (3.0 * f[:, -1, :] - 4.0 * f[:, -2, :] + f[:, -3, :]) / (2.0 * self.dy)
+            else:
+                out[:, 0, :] = (f[:, 1, :] - f[:, 0, :]) / self.dy
+                out[:, -1, :] = (f[:, -1, :] - f[:, -2, :]) / self.dy
+            return out
+        out[:, 2:-2, :] = (-f[:, 4:, :] + 8.0 * f[:, 3:-1, :] - 8.0 * f[:, 1:-3, :] + f[:, :-4, :]) / (12.0 * self.dy)
+        out[:, 1, :] = (f[:, 2, :] - f[:, 0, :]) / (2.0 * self.dy)
+        out[:, -2, :] = (f[:, -1, :] - f[:, -3, :]) / (2.0 * self.dy)
+        out[:, 0, :] = (-3.0 * f[:, 0, :] + 4.0 * f[:, 1, :] - f[:, 2, :]) / (2.0 * self.dy)
+        out[:, -1, :] = (3.0 * f[:, -1, :] - 4.0 * f[:, -2, :] + f[:, -3, :]) / (2.0 * self.dy)
+        return out
+
+    def _d_dz_centered(self, f: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros_like(f)
+        nz = f.size(0)
+        if nz < 2: return out
+        if self._finite_difference_order == 2 or nz < 5:
+            if nz >= 3:
+                out[1:-1] = (f[2:] - f[:-2]) / (2.0 * self.dz)
+                out[0] = (-3.0 * f[0] + 4.0 * f[1] - f[2]) / (2.0 * self.dz)
+                out[-1] = (3.0 * f[-1] - 4.0 * f[-2] + f[-3]) / (2.0 * self.dz)
+            else:
+                out[0] = (f[1] - f[0]) / self.dz
+                out[-1] = (f[-1] - f[-2]) / self.dz
+            return out
+        out[2:-2] = (-f[4:] + 8.0 * f[3:-1] - 8.0 * f[1:-3] + f[:-4]) / (12.0 * self.dz)
+        out[1] = (f[2] - f[0]) / (2.0 * self.dz)
+        out[-2] = (f[-1] - f[-3]) / (2.0 * self.dz)
+        out[0] = (-3.0 * f[0] + 4.0 * f[1] - f[2]) / (2.0 * self.dz)
+        out[-1] = (3.0 * f[-1] - 4.0 * f[-2] + f[-3]) / (2.0 * self.dz)
+        return out
+
+    # =================================================================
+    # Physics helpers
+    # =================================================================
+    def compute_parallel_currents(self, J, B):
+        B2 = torch.clamp(B[0] ** 2 + B[1] ** 2 + B[2] ** 2, min=1e-20)
+        alpha = (J[0] * B[0] + J[1] * B[1] + J[2] * B[2]) / B2
+        return torch.stack([alpha * B[0], alpha * B[1], alpha * B[2]])
+
+    def _d_dx_2d(self, f: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros_like(f)
+        nx = f.size(1)
+        if nx < 2:
+            return out
+        if self._finite_difference_order == 2 or nx < 5:
+            if nx >= 3:
+                out[:, 1:-1] = (f[:, 2:] - f[:, :-2]) / (2.0 * self.dx)
+                out[:, 0] = (-3.0 * f[:, 0] + 4.0 * f[:, 1] - f[:, 2]) / (2.0 * self.dx)
+                out[:, -1] = (3.0 * f[:, -1] - 4.0 * f[:, -2] + f[:, -3]) / (2.0 * self.dx)
+            else:
+                out[:, 0] = (f[:, 1] - f[:, 0]) / self.dx
+                out[:, -1] = (f[:, -1] - f[:, -2]) / self.dx
+            return out
+        out[:, 2:-2] = (-f[:, 4:] + 8.0 * f[:, 3:-1] - 8.0 * f[:, 1:-3] + f[:, :-4]) / (12.0 * self.dx)
+        out[:, 1] = (f[:, 2] - f[:, 0]) / (2.0 * self.dx)
+        out[:, -2] = (f[:, -1] - f[:, -3]) / (2.0 * self.dx)
+        out[:, 0] = (-3.0 * f[:, 0] + 4.0 * f[:, 1] - f[:, 2]) / (2.0 * self.dx)
+        out[:, -1] = (3.0 * f[:, -1] - 4.0 * f[:, -2] + f[:, -3]) / (2.0 * self.dx)
+        return out
+
+    def _d_dy_2d(self, f: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros_like(f)
+        ny = f.size(0)
+        if ny < 2:
+            return out
+        if self._finite_difference_order == 2 or ny < 5:
+            if ny >= 3:
+                out[1:-1, :] = (f[2:, :] - f[:-2, :]) / (2.0 * self.dy)
+                out[0, :] = (-3.0 * f[0, :] + 4.0 * f[1, :] - f[2, :]) / (2.0 * self.dy)
+                out[-1, :] = (3.0 * f[-1, :] - 4.0 * f[-2, :] + f[-3, :]) / (2.0 * self.dy)
+            else:
+                out[0, :] = (f[1, :] - f[0, :]) / self.dy
+                out[-1, :] = (f[-1, :] - f[-2, :]) / self.dy
+            return out
+        out[2:-2, :] = (-f[4:, :] + 8.0 * f[3:-1, :] - 8.0 * f[1:-3, :] + f[:-4, :]) / (12.0 * self.dy)
+        out[1, :] = (f[2, :] - f[0, :]) / (2.0 * self.dy)
+        out[-2, :] = (f[-1, :] - f[-3, :]) / (2.0 * self.dy)
+        out[0, :] = (-3.0 * f[0, :] + 4.0 * f[1, :] - f[2, :]) / (2.0 * self.dy)
+        out[-1, :] = (3.0 * f[-1, :] - 4.0 * f[-2, :] + f[-3, :]) / (2.0 * self.dy)
+        return out
+
+    def _smooth_bottom_2d(self, a2: torch.Tensor, n_passes: int) -> torch.Tensor:
+        n = int(n_passes)
+        if n <= 0: return a2
+        if a2.ndim != 2: raise ValueError(f"Expected 2D tensor, got shape={tuple(a2.shape)}")
+        if a2.shape[0] < 3 or a2.shape[1] < 3: return a2
+
+        k = torch.tensor([[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]], device=a2.device, dtype=a2.dtype)
+        k = (k / 16.0).view(1, 1, 3, 3)
+        x = a2[None, None, :, :]
+        for _ in range(n):
+            x = F.pad(x, (1, 1, 1, 1), mode="reflect")
+            x = F.conv2d(x, k)
+        return x[0, 0]
+
+    def _bottom_plane_2d(self, a: torch.Tensor, name: str) -> torch.Tensor:
+        """Accept a bottom map or a zyx volume and return the z=0 map."""
+        if a.ndim == 2:
+            return a
+        if a.ndim == 3:
+            if int(a.shape[0]) != self.Nz:
+                raise ValueError(
+                    f"{name} 3D input must be in (Nz, Ny, Nx) order with Nz={self.Nz}; "
+                    f"got {tuple(a.shape)}."
+                )
+            return a[0]
+        raise ValueError(f"{name} must be 2D (Ny, Nx) or 3D (Nz, Ny, Nx); got {tuple(a.shape)}.")
+
+    def _derive_bottom_jz_fortran(self, Bx_obs: torch.Tensor, By_obs: torch.Tensor, *, ijzbcor: int = 3) -> torch.Tensor:
+        """
+        Fortran-compatible bottom Jz from vector magnetogram Bx/By.
+
+        Mirrors nfpt_1.0.2.f90 readin + botbal: insert the observed FOV into
+        the padded MUDPACK grid, compute centered Jz there, apply sign-separated
+        flux balancing, then crop the observed FOV back out.
+        """
+        if Bx_obs.ndim != 2 or By_obs.ndim != 2 or Bx_obs.shape != By_obs.shape:
+            raise ValueError(
+                "Bx_obs/By_obs must be matching 2D bottom maps after bottom-plane extraction; "
+                f"got {tuple(Bx_obs.shape)}, {tuple(By_obs.shape)}."
+            )
+
+        nyo, nxo = int(Bx_obs.shape[0]), int(Bx_obs.shape[1])
+        fgrid = nfpt_fortran_grid(nxo, nyo, max(2, int(self.Nz)))
+        bxb = torch.zeros((fgrid.ny, fgrid.nx), device=Bx_obs.device, dtype=Bx_obs.dtype)
+        byb = torch.zeros_like(bxb)
+        y1 = fgrid.bfy + nyo
+        x1 = fgrid.bfx + nxo
+        bxb[fgrid.bfy : y1, fgrid.bfx : x1] = Bx_obs
+        byb[fgrid.bfy : y1, fgrid.bfx : x1] = By_obs
+
+        jzb = torch.zeros_like(bxb)
+        if fgrid.nx >= 3 and fgrid.ny >= 3:
+            jzb[1:-1, 1:-1] = (
+                (byb[1:-1, 2:] - byb[1:-1, :-2]) / (2.0 * self.dx)
+                - (bxb[2:, 1:-1] - bxb[:-2, 1:-1]) / (2.0 * self.dy)
+            )
+
+        mode = int(ijzbcor)
+        if mode >= 2 and fgrid.nx >= 3 and fgrid.ny >= 3:
+            jzp = torch.where(jzb >= 0.0, jzb, torch.zeros_like(jzb))
+            jzn = torch.where(jzb < 0.0, jzb, torch.zeros_like(jzb))
+
+            def cell_sum(a: torch.Tensor) -> torch.Tensor:
+                return 0.25 * (
+                    a[1:-1, 2:].sum()
+                    + a[2:, 1:-1].sum()
+                    + a[1:-1, 1:-1].sum()
+                    + a[2:, 2:].sum()
+                )
+
+            jzsum = cell_sum(jzb)
+            jzpsum = cell_sum(jzp)
+            jznsum = cell_sum(jzn)
+
+            if mode == 2:
+                jzflcor = jzpsum - 0.5 * jzsum
+            elif mode == 3:
+                jzflcor = torch.maximum(jzpsum, torch.abs(jznsum))
+            elif mode == 4:
+                jzflcor = torch.minimum(jzpsum, torch.abs(jznsum))
+            else:
+                jzflcor = None
+
+            if jzflcor is not None:
+                pos = jzb >= 0.0
+                neg = ~pos
+                if torch.abs(jzpsum) > 0.0:
+                    jzb = torch.where(pos, (jzflcor / jzpsum) * jzb, jzb)
+                if torch.abs(jznsum) > 0.0:
+                    jzb = torch.where(neg, (jzflcor / torch.abs(jznsum)) * jzb, jzb)
+
+        # Padded-box physical boundary nodes are set to zero by botbal.
+        jzb[0, :] = 0.0
+        jzb[-1, :] = 0.0
+        jzb[:, 0] = 0.0
+        jzb[:, -1] = 0.0
+        return jzb[fgrid.bfy : y1, fgrid.bfx : x1]
+
+    def _make_cosine_bell_1d(self, n: int, thickness: int) -> torch.Tensor:
+        if thickness <= 0: return torch.ones(n, device=self.device, dtype=self.dtype)
+        t = min(thickness, max(1, (n - 1) // 2))
+        idx = torch.arange(n, device=self.device, dtype=self.dtype)
+        dist = torch.minimum(idx, (n - 1) - idx)
+        w = torch.where(dist >= float(t), torch.ones_like(dist), 0.5 * (1.0 - torch.cos(torch.pi * dist / float(t))))
+        return w
+
+    def _make_buffer_window(self, thickness: int, *, xy_only: bool = False) -> torch.Tensor:
+        wx = self._make_cosine_bell_1d(self.Nx, thickness)
+        wy = self._make_cosine_bell_1d(self.Ny, thickness)
+
+        if thickness <= 0 or xy_only:
+            wz = torch.ones(self.Nz, device=self.device, dtype=self.dtype)
+        else:
+            t = min(thickness, max(1, self.Nz - 1))
+            k = torch.arange(self.Nz, device=self.device, dtype=self.dtype)
+            dist_top = (self.Nz - 1) - k
+            wz = torch.where(dist_top >= float(t), torch.ones_like(dist_top), 0.5 * (1.0 - torch.cos(torch.pi * dist_top / float(t))))
+            wz[0] = 1.0
+
+        W = wz[:, None, None] * wy[None, :, None] * wx[None, None, :]
+        return W.to(dtype=self.dtype)
+
+    def _pad_or_crop_center_2d(self, a2: torch.Tensor, target_ny: int, target_nx: int, *, pad_value: float = 0.0):
+        if a2.ndim != 2: raise ValueError(f"Expected 2D tensor, got shape={tuple(a2.shape)}")
+        ny, nx = int(a2.shape[0]), int(a2.shape[1])
+        out = torch.full((target_ny, target_nx), float(pad_value), device=a2.device, dtype=a2.dtype)
+
+        src_y0 = max(0, (ny - target_ny) // 2)
+        src_x0 = max(0, (nx - target_nx) // 2)
+        src_y1 = src_y0 + min(ny, target_ny)
+        src_x1 = src_x0 + min(nx, target_nx)
+
+        dst_y0 = max(0, (target_ny - ny) // 2)
+        dst_x0 = max(0, (target_nx - nx) // 2)
+        dst_y1 = dst_y0 + (src_y1 - src_y0)
+        dst_x1 = dst_x0 + (src_x1 - src_x0)
+
+        out[dst_y0:dst_y1, dst_x0:dst_x1] = a2[src_y0:src_y1, src_x0:src_x1]
+        return out, (slice(dst_y0, dst_y1), slice(dst_x0, dst_x1))
+
+    def compute_potential_field_from_bottom_bz(self) -> torch.Tensor:
+        if self.Bz_obs is None:
+            raise RuntimeError("Bottom boundary (Bz_obs) is not set.")
+
+        zeros = torch.zeros(self.Nz, self.Ny, self.Nx, device=self.device, dtype=self.dtype)
+        Bz_pot = self._solve_poisson_3d(zeros, "neumann", self.Bz_obs, "neumann")
+        Phi_pot = self._solve_phi_neumann_with_bc1_flux(Bz_pot)
+        Phi_pot[0] = self.Phi_bottom
+        self.Phi_pot = Phi_pot
+
+        if self._fortran_iphiws3_potential:
+            Bx_pot, By_pot = self._compute_iphiws3_potential_horizontal_from_bottom_bz()
+        else:
+            Az_zero = torch.zeros_like(Phi_pot)
+            Bx_pot, By_pot = self._compute_B_horizontal(Phi_pot, Az_zero)
+        B_pot = torch.stack([Bx_pot, By_pot, Bz_pot])
+        return B_pot
+
+    def _solve_iphiws3_scalar_potential(self) -> torch.Tensor:
+        """
+        Approximate Fortran iphiws3's scalar potential solve.
+
+        iphiws3 calls FISHPACK hw3crt for Laplace's equation with homogeneous
+        Neumann conditions on x/y, bottom z-derivative equal to observed Bz,
+        and a specified top scalar potential.  This scalar is used only to
+        reconstruct the saved potential-field horizontal components; the PT
+        scalar Phi used by the NFPT iteration is still produced by phimp.
+        """
+        if self.Bz_obs is None:
+            raise RuntimeError("Bottom boundary (Bz_obs) is not set.")
+
+        g_hat = self._dct1(self._dct1(self.Bz_obs, -1), -2)
+        kx = torch.arange(0, self.Nx, device=self.device, dtype=self.dtype)
+        ky = torch.arange(0, self.Ny, device=self.device, dtype=self.dtype)
+        lam_x = -4.0 * torch.sin(torch.pi * kx / (2.0 * max(self.Nx - 1, 1))) ** 2 / (self.dx**2)
+        lam_y = -4.0 * torch.sin(torch.pi * ky / (2.0 * max(self.Ny - 1, 1))) ** 2 / (self.dy**2)
+        Lam_y, Lam_x = torch.meshgrid(lam_y, lam_x, indexing="ij")
+        lam_xy = Lam_x + Lam_y
+
+        n_solve = self.Nz - 1  # top z plane is specified to zero (hw3crt bcz=4)
+        psi_hat = torch.zeros((self.Nz, self.Ny, self.Nx), device=self.device, dtype=self.dtype)
+        if n_solve <= 0:
+            return psi_hat
+
+        dz2 = self.dz * self.dz
+        lower = torch.full((n_solve, self.Ny, self.Nx), 1.0 / dz2, device=self.device, dtype=self.dtype)
+        diag = (lam_xy - 2.0 / dz2).unsqueeze(0).expand(n_solve, -1, -1).clone()
+        upper = torch.full_like(lower, 1.0 / dz2)
+        rhs = torch.zeros_like(lower)
+
+        # Bottom Neumann: ghost elimination gives
+        # (lambda - 2/dz^2) u0 + (2/dz^2) u1 = 2*g/dz.
+        lower[0] = 0.0
+        upper[0] = 2.0 / dz2
+        rhs[0] = 2.0 * g_hat / self.dz
+
+        # Top scalar potential is specified as zero, so the last solved row has
+        # no upper coupling contribution.
+        upper[-1] = 0.0
+
+        cprime = torch.empty_like(upper)
+        dprime = torch.empty_like(rhs)
+        denom = diag[0]
+        cprime[0] = upper[0] / denom
+        dprime[0] = rhs[0] / denom
+        for k in range(1, n_solve):
+            denom = diag[k] - lower[k] * cprime[k - 1]
+            cprime[k] = upper[k] / denom
+            dprime[k] = (rhs[k] - lower[k] * dprime[k - 1]) / denom
+
+        sol = torch.empty_like(rhs)
+        sol[-1] = dprime[-1]
+        for k in range(n_solve - 2, -1, -1):
+            sol[k] = dprime[k] - cprime[k] * sol[k + 1]
+        psi_hat[:n_solve] = sol
+        return self._idct1(self._idct1(psi_hat, -1), -2)
+
+    def _compute_iphiws3_potential_horizontal_from_bottom_bz(self) -> tuple[torch.Tensor, torch.Tensor]:
+        psi = self._solve_iphiws3_scalar_potential()
+        Bx = torch.zeros_like(psi)
+        By = torch.zeros_like(psi)
+
+        if self.Nx >= 3:
+            Bx[:, :, 1:-1] = (psi[:, :, 2:] - psi[:, :, :-2]) / (2.0 * self.dx)
+        if self.Ny >= 3:
+            By[:, 1:-1, :] = (psi[:, 2:, :] - psi[:, :-2, :]) / (2.0 * self.dy)
+
+        # iphiws3 stores horizontal components as zero on side boundaries and
+        # on the source-surface top plane.
+        if self.Nx > 1:
+            Bx[:, :, 0] = 0.0
+            Bx[:, :, -1] = 0.0
+        if self.Ny > 1:
+            By[:, 0, :] = 0.0
+            By[:, -1, :] = 0.0
+        if self.Nz > 1:
+            Bx[-1] = 0.0
+            By[-1] = 0.0
+        return Bx, By
+
+    def _compute_B_horizontal(self, Phi, Az):
+        dPhi_dz = self._d_dz_centered(Phi)
+        Bx = -self._d_dx_centered(dPhi_dz) + self._d_dy_centered(Az)
+        By = -self._d_dy_centered(dPhi_dz) - self._d_dx_centered(Az)
+        return Bx, By
+
+    def _d2dz2(self, f):
+        dz2 = self.dz ** 2
+        d2 = torch.zeros_like(f)
+        if f.shape[0] >= 3: d2[1:-1] = (f[2:] - 2 * f[1:-1] + f[:-2]) / dz2
+        if f.shape[0] >= 2:
+            if f.shape[0] >= 4:
+                d2[0] = (2.0 * f[0] - 5.0 * f[1] + 4.0 * f[2] - f[3]) / dz2
+            else:
+                d2[0] = (f[1] - f[0]) / dz2
+            d2[-1] = (-2.0 * f[-1] + 2.0 * f[-2]) / dz2
+        return d2
+
+    def _d2_dxdz(self, f: torch.Tensor) -> torch.Tensor:
+        d2 = torch.zeros_like(f)
+        if f.size(0) < 3 or f.size(2) < 3: return d2
+        d2[1:-1, :, 1:-1] = (f[2:, :, 2:] - f[:-2, :, 2:] - f[2:, :, :-2] + f[:-2, :, :-2]) / (4.0 * self.dx * self.dz)
+        return d2
+
+    def _d2_dydz(self, f: torch.Tensor) -> torch.Tensor:
+        d2 = torch.zeros_like(f)
+        if f.size(0) < 3 or f.size(1) < 3: return d2
+        d2[1:-1, 1:-1, :] = (f[2:, 2:, :] - f[:-2, 2:, :] - f[2:, :-2, :] + f[:-2, :-2, :]) / (4.0 * self.dy * self.dz)
+        return d2
+
+    def _lap_xy(self, f):
+        lap = torch.zeros_like(f)
+        lap[..., 1:-1] += (f[..., 2:] - 2 * f[..., 1:-1] + f[..., :-2]) / self.dx**2
+        lap[..., 1:-1, :] += (f[..., 2:, :] - 2 * f[..., 1:-1, :] + f[..., :-2, :]) / self.dy**2
+        lap[..., 0, :] += (2 * f[..., 1, :] - 2 * f[..., 0, :]) / self.dy**2
+        lap[..., -1, :] += (2 * f[..., -2, :] - 2 * f[..., -1, :]) / self.dy**2
+        lap[..., 0] += (2 * f[..., 1] - 2 * f[..., 0]) / self.dx**2
+        lap[..., -1] += (2 * f[..., -2] - 2 * f[..., -1]) / self.dx**2
+        return lap
+
+    def _lap_xy_spectral(self, f: torch.Tensor, bc: str = "neumann") -> torch.Tensor:
+        src_ext = self._extend_xy(f, bc)
+        src_hat = torch.fft.rfft2(src_ext, dim=(-2, -1))
+        del src_ext
+        src_hat.mul_(self.lam_xy)
+        src_hat[..., 0, 0] = 0.0
+        lap = torch.fft.irfft2(src_hat, s=(2 * self.Ny, 2 * self.Nx), dim=(-2, -1))
+        return self._extract_xy(lap)
+
+    def _compute_J_horizontal(self, Phi, Az, Bz):
+        dAz_dz = self._d_dz_centered(Az)
+        lap_Phi = Bz + self._d2dz2(Phi)
+        if self._lap_phi_z_boundary_mean:
+            lap_Phi[0] = lap_Phi[0].mean()
+            lap_Phi[-1] = lap_Phi[-1].mean()
+        Jx = self._d_dx_centered(dAz_dz) + self._d_dy_centered(lap_Phi)
+        Jy = self._d_dy_centered(dAz_dz) - self._d_dx_centered(lap_Phi)
+        return Jx, Jy
+
+    def _pad_phi_for_ghstpa(self, Phi: torch.Tensor) -> torch.Tensor:
+        p = torch.empty(
+            (self.Nz + 1, self.Ny + 2, self.Nx + 2),
+            device=Phi.device,
+            dtype=Phi.dtype,
+        )
+        p[: self.Nz, 1:-1, 1:-1] = Phi
+        if self.Nz > 1:
+            p[self.Nz, 1:-1, 1:-1] = Phi[-2]
+        else:
+            p[self.Nz, 1:-1, 1:-1] = Phi[-1]
+
+        p[:, 1:-1, 0] = p[:, 1:-1, 2]
+        p[:, 1:-1, -1] = p[:, 1:-1, -3]
+        p[:, 0, :] = p[:, 2, :]
+        p[:, -1, :] = p[:, -3, :]
+        return p
+
+    def _pad_az_for_ghstpa(self, Az: torch.Tensor) -> torch.Tensor:
+        a_phys = Az.clone()
+        if self.Nx > 1:
+            a_phys[:, :, 0] = 0.0
+            a_phys[:, :, -1] = 0.0
+        if self.Ny > 1:
+            a_phys[:, 0, :] = 0.0
+            a_phys[:, -1, :] = 0.0
+        if self.Nz > 1:
+            a_phys[-1] = 0.0
+
+        a = torch.empty(
+            (self.Nz + 1, self.Ny + 2, self.Nx + 2),
+            device=Az.device,
+            dtype=Az.dtype,
+        )
+        a[: self.Nz, 1:-1, 1:-1] = a_phys
+        if self.Nz > 1:
+            a[self.Nz, 1:-1, 1:-1] = -a_phys[-2]
+        else:
+            a[self.Nz, 1:-1, 1:-1] = -a_phys[-1]
+
+        a[:, 1:-1, 0] = -a[:, 1:-1, 2]
+        a[:, 1:-1, -1] = -a[:, 1:-1, -3]
+        a[:, 0, :] = -a[:, 2, :]
+        a[:, -1, :] = -a[:, -3, :]
+        return a
+
+    def _pad_bz_for_ghstb(self, Bz: torch.Tensor) -> torch.Tensor:
+        b = torch.empty(
+            (self.Nz, self.Ny + 2, self.Nx + 2),
+            device=Bz.device,
+            dtype=Bz.dtype,
+        )
+        b[:, 1:-1, 1:-1] = Bz
+        b[:, 1:-1, 0] = b[:, 1:-1, 2]
+        b[:, 1:-1, -1] = b[:, 1:-1, -3]
+        b[:, 0, :] = b[:, 2, :]
+        b[:, -1, :] = b[:, -3, :]
+        return b
+
+    def _compute_bjt00_fortran_like(self, Phi: torch.Tensor, Az: torch.Tensor, Bz: torch.Tensor):
+        """Reconstruct Bx/By/Jx/Jy with the same second-order stencils as Fortran bjt00."""
+        p = self._pad_phi_for_ghstpa(Phi)
+        a = self._pad_az_for_ghstpa(Az)
+        bz = self._pad_bz_for_ghstb(Bz)
+
+        Bx = torch.zeros_like(Bz)
+        By = torch.zeros_like(Bz)
+        Jx = torch.zeros_like(Bz)
+        Jy = torch.zeros_like(Bz)
+
+        dx2i = 0.5 / self.dx
+        dy2i = 0.5 / self.dy
+        dz2i = 0.5 / self.dz
+        dzpi = 1.0 / self.dz
+        dzdzi = 1.0 / (self.dz * self.dz)
+
+        # z = 0 uses Fortran's forward z derivative formulas.
+        Bx[0] = (
+            dy2i * (a[0, 2:, 1:-1] - a[0, :-2, 1:-1])
+            - dx2i
+            * dzpi
+            * (
+                -0.5 * p[2, 1:-1, 2:]
+                + 2.0 * p[1, 1:-1, 2:]
+                - 1.5 * p[0, 1:-1, 2:]
+                + 0.5 * p[2, 1:-1, :-2]
+                - 2.0 * p[1, 1:-1, :-2]
+                + 1.5 * p[0, 1:-1, :-2]
+            )
+        )
+        By[0] = (
+            -dy2i
+            * dzpi
+            * (
+                -0.5 * p[2, 2:, 1:-1]
+                + 2.0 * p[1, 2:, 1:-1]
+                - 1.5 * p[0, 2:, 1:-1]
+                + 0.5 * p[2, :-2, 1:-1]
+                - 2.0 * p[1, :-2, 1:-1]
+                + 1.5 * p[0, :-2, 1:-1]
+            )
+            - dx2i * (a[0, 1:-1, 2:] - a[0, 1:-1, :-2])
+        )
+        Jx[0] = (
+            dy2i * (bz[0, 2:, 1:-1] - bz[0, :-2, 1:-1])
+            + dy2i
+            * dzdzi
+            * (
+                -p[3, 2:, 1:-1]
+                + 4.0 * p[2, 2:, 1:-1]
+                - 5.0 * p[1, 2:, 1:-1]
+                + 2.0 * p[0, 2:, 1:-1]
+                + p[3, :-2, 1:-1]
+                - 4.0 * p[2, :-2, 1:-1]
+                + 5.0 * p[1, :-2, 1:-1]
+                - 2.0 * p[0, :-2, 1:-1]
+            )
+            + dx2i
+            * dzpi
+            * (
+                -0.5 * a[2, 1:-1, 2:]
+                + 2.0 * a[1, 1:-1, 2:]
+                - 1.5 * a[0, 1:-1, 2:]
+                + 0.5 * a[2, 1:-1, :-2]
+                - 2.0 * a[1, 1:-1, :-2]
+                + 1.5 * a[0, 1:-1, :-2]
+            )
+        )
+        Jy[0] = (
+            -dx2i * (bz[0, 1:-1, 2:] - bz[0, 1:-1, :-2])
+            - dx2i
+            * dzdzi
+            * (
+                -p[3, 1:-1, 2:]
+                + 4.0 * p[2, 1:-1, 2:]
+                - 5.0 * p[1, 1:-1, 2:]
+                + 2.0 * p[0, 1:-1, 2:]
+                + p[3, 1:-1, :-2]
+                - 4.0 * p[2, 1:-1, :-2]
+                + 5.0 * p[1, 1:-1, :-2]
+                - 2.0 * p[0, 1:-1, :-2]
+            )
+            + dy2i
+            * dzpi
+            * (
+                -0.5 * a[2, 2:, 1:-1]
+                + 2.0 * a[1, 2:, 1:-1]
+                - 1.5 * a[0, 2:, 1:-1]
+                + 0.5 * a[2, :-2, 1:-1]
+                - 2.0 * a[1, :-2, 1:-1]
+                + 1.5 * a[0, :-2, 1:-1]
+            )
+        )
+
+        if self.Nz > 1:
+            z = slice(1, self.Nz)
+            zp = slice(2, self.Nz + 1)
+            z0 = slice(1, self.Nz)
+            zn = slice(0, self.Nz - 1)
+
+            Bx[z] = (
+                dy2i * (a[z0, 2:, 1:-1] - a[z0, :-2, 1:-1])
+                - dx2i
+                * dz2i
+                * (
+                    p[zp, 1:-1, 2:]
+                    - p[zn, 1:-1, 2:]
+                    - p[zp, 1:-1, :-2]
+                    + p[zn, 1:-1, :-2]
+                )
+            )
+            By[z] = (
+                -dy2i
+                * dz2i
+                * (
+                    p[zp, 2:, 1:-1]
+                    - p[zn, 2:, 1:-1]
+                    - p[zp, :-2, 1:-1]
+                    + p[zn, :-2, 1:-1]
+                )
+                - dx2i * (a[z0, 1:-1, 2:] - a[z0, 1:-1, :-2])
+            )
+            Jx[z] = (
+                dy2i * (bz[z0, 2:, 1:-1] - bz[z0, :-2, 1:-1])
+                + dy2i
+                * dzdzi
+                * (
+                    p[zp, 2:, 1:-1]
+                    + p[zn, 2:, 1:-1]
+                    - 2.0 * p[z0, 2:, 1:-1]
+                    - p[zp, :-2, 1:-1]
+                    - p[zn, :-2, 1:-1]
+                    + 2.0 * p[z0, :-2, 1:-1]
+                )
+                + dx2i
+                * dz2i
+                * (
+                    a[zp, 1:-1, 2:]
+                    - a[zn, 1:-1, 2:]
+                    - a[zp, 1:-1, :-2]
+                    + a[zn, 1:-1, :-2]
+                )
+            )
+            Jy[z] = (
+                -dx2i * (bz[z0, 1:-1, 2:] - bz[z0, 1:-1, :-2])
+                - dx2i
+                * dzdzi
+                * (
+                    p[zp, 1:-1, 2:]
+                    + p[zn, 1:-1, 2:]
+                    - 2.0 * p[z0, 1:-1, 2:]
+                    - p[zp, 1:-1, :-2]
+                    - p[zn, 1:-1, :-2]
+                    + 2.0 * p[z0, 1:-1, :-2]
+                )
+                + dy2i
+                * dz2i
+                * (
+                    a[zp, 2:, 1:-1]
+                    - a[zn, 2:, 1:-1]
+                    - a[zp, :-2, 1:-1]
+                    + a[zn, :-2, 1:-1]
+                )
+            )
+
+        return Bx, By, Jx, Jy
+
+    # =================================================================
+    # Boundary setup  (Step 2 — once for all)
+    # =================================================================
+    def set_bottom_boundary(
+        self,
+        Bz_obs,
+        Jz_obs=None,
+        zero_net_current: Optional[bool] = None,
+        *,
+        Bx_obs=None,
+        By_obs=None,
+        smooth_passes: Optional[int] = None,
+        padded_buffer_zone: Optional[bool] = None,
+        ijzbcor: int = 3,
+    ):
+        if isinstance(Bz_obs, np.ndarray):
+            Bz_obs = torch.as_tensor(np.asarray(Bz_obs), dtype=self.dtype, device=self.device)
+        else:
+            Bz_obs = Bz_obs.to(self.device, dtype=self.dtype)
+
+        if (Bx_obs is None) != (By_obs is None):
+            raise ValueError("Bx_obs and By_obs must be provided together when deriving bottom Jz.")
+        if Bx_obs is not None:
+            if isinstance(Bx_obs, np.ndarray):
+                Bx_obs = torch.as_tensor(np.asarray(Bx_obs), dtype=self.dtype, device=self.device)
+            else:
+                Bx_obs = Bx_obs.to(self.device, dtype=self.dtype)
+            if isinstance(By_obs, np.ndarray):
+                By_obs = torch.as_tensor(np.asarray(By_obs), dtype=self.dtype, device=self.device)
+            else:
+                By_obs = By_obs.to(self.device, dtype=self.dtype)
+
+        Bz_obs = self._bottom_plane_2d(Bz_obs, "Bz_obs")
+        if Bx_obs is not None:
+            Bx_obs = self._bottom_plane_2d(Bx_obs, "Bx_obs")
+            By_obs = self._bottom_plane_2d(By_obs, "By_obs")
+
+        derived_jz = Jz_obs is None
+        if derived_jz:
+            if Bx_obs is None:
+                raise ValueError("Jz_obs was not provided; pass Bx_obs and By_obs to derive Fortran-compatible bottom Jz.")
+        else:
+            if isinstance(Jz_obs, np.ndarray):
+                Jz_obs = torch.as_tensor(np.asarray(Jz_obs), dtype=self.dtype, device=self.device)
+            else:
+                Jz_obs = Jz_obs.to(self.device, dtype=self.dtype)
+            Jz_obs = self._bottom_plane_2d(Jz_obs, "Jz_obs")
+
+        if zero_net_current is None:
+            zero_net_current = not derived_jz
+        if smooth_passes is None:
+            smooth_passes = 0 if derived_jz else 3
+
+        if Bz_obs.ndim != 2 or (not derived_jz and Jz_obs.ndim != 2):
+            jz_shape = None if derived_jz else tuple(Jz_obs.shape)
+            raise ValueError(f"Bz_obs/Jz_obs must be 2D. Got {tuple(Bz_obs.shape)}, {jz_shape}")
+        if Bx_obs is not None and (Bx_obs.shape != Bz_obs.shape or By_obs.shape != Bz_obs.shape):
+            raise ValueError(
+                "Bx_obs/By_obs must have the same observed-FOV shape as Bz_obs. "
+                f"Got Bx={tuple(Bx_obs.shape)}, By={tuple(By_obs.shape)}, Bz={tuple(Bz_obs.shape)}."
+            )
+
+        use_pad = self._padded_buffer_zone if padded_buffer_zone is None else bool(padded_buffer_zone)
+
+        if int(Bz_obs.shape[0]) != self.Ny or int(Bz_obs.shape[1]) != self.Nx:
+            if not use_pad:
+                raise ValueError(
+                    f"Bz_obs/Jz_obs must have shape ({self.Ny}, {self.Nx}); got {tuple(Bz_obs.shape)}."
+                )
+            obs_ny, obs_nx = int(Bz_obs.shape[0]), int(Bz_obs.shape[1])
+            Bz_obs, fov_sl = self._pad_or_crop_center_2d(Bz_obs, self.Ny, self.Nx, pad_value=0.0)
+            if not derived_jz:
+                Jz_obs, _ = self._pad_or_crop_center_2d(Jz_obs, self.Ny, self.Nx, pad_value=0.0)
+            if Bx_obs is not None:
+                Bx_obs, _ = self._pad_or_crop_center_2d(Bx_obs, self.Ny, self.Nx, pad_value=0.0)
+                By_obs, _ = self._pad_or_crop_center_2d(By_obs, self.Ny, self.Nx, pad_value=0.0)
+            self.fov_slice_yx = fov_sl
+            nzo = min(self.Nz, self._input_shape_zyx[0])
+            self._observed_shape_zyx = (nzo, obs_ny, obs_nx)
+        else:
+            self.fov_slice_yx = (slice(0, self.Ny), slice(0, self.Nx))
+            self._observed_shape_zyx = (self.Nz, self.Ny, self.Nx)
+
+        if derived_jz:
+            Jz_obs = self._derive_bottom_jz_fortran(Bx_obs, By_obs, ijzbcor=ijzbcor)
+
+        if int(smooth_passes) > 0:
+            Bz_obs = self._smooth_bottom_2d(Bz_obs, smooth_passes)
+            Jz_obs = self._smooth_bottom_2d(Jz_obs, smooth_passes)
+            if Bx_obs is not None:
+                Bx_obs = self._smooth_bottom_2d(Bx_obs, smooth_passes)
+                By_obs = self._smooth_bottom_2d(By_obs, smooth_passes)
+
+        if zero_net_current:
+            Jz_obs = Jz_obs - Jz_obs.mean()
+
+        self.Bz_obs = Bz_obs.clone()
+        self.Jz_obs = Jz_obs.clone()
+        self.Bx_obs = Bx_obs.clone() if Bx_obs is not None else None
+        self.By_obs = By_obs.clone() if By_obs is not None else None
+        self._reset_boundary_hat_cache()
+
+        if self._lateral_wall == "BC1":
+            self._bc1_p1 = self._compute_bc1_p1_from_bz_obs()
+        else:
+            self._bc1_p1 = None
+
+        self.Phi_bottom = self._solve_phi_neumann_with_bc1_flux(self.Bz_obs.unsqueeze(0)).squeeze(0).clone()
+        self.Az_bottom = self._solve_poisson_2d((-self.Jz_obs).unsqueeze(0), "dirichlet").squeeze(0).clone()
+
+        # PRECOMPUTE: Background Potential Field
+        self.B_pot = self.compute_potential_field_from_bottom_bz()
+
+        self.buffer_window = self._make_buffer_window(self.buffer_thickness, xy_only=self._buffer_xy_only)
+
+    def set_bottom_vector_boundary(self, Bx_obs, By_obs, Bz_obs, **kwargs):
+        """
+        Set the bottom boundary from vector magnetogram components only.
+
+        Bx_obs/By_obs/Bz_obs may be bottom maps in (Ny, Nx) order or full
+        component volumes in (Nz, Ny, Nx) order. Jz_obs is derived internally
+        with the Fortran readin + botbal stencil.
+        """
+        return self.set_bottom_boundary(
+            Bz_obs=Bz_obs,
+            Jz_obs=None,
+            Bx_obs=Bx_obs,
+            By_obs=By_obs,
+            **kwargs,
+        )
+
+    def _compute_bc1_p1_from_bz_obs(self) -> torch.Tensor:
+        B = self.Bz_obs
+        Ny, Nx = int(B.shape[0]), int(B.shape[1])
+        dx, dy = float(self.dx), float(self.dy)
+        perim = 2.0 * (float(Nx - 1) * dx + float(Ny - 1) * dy)
+        if Nx < 2 or Ny < 2 or perim == 0.0:
+            return torch.zeros((), device=self.device, dtype=self.dtype)
+        bflux = B[:-1, :-1].sum() * dx * dy
+        return (bflux / perim).to(dtype=self.dtype)
+
+    def _enforce_lateral_bz_homogeneous_neumann(self, Bz: torch.Tensor) -> None:
+        if self.Nx > 1: Bz[:, 1:-1, 0] = Bz[:, 1:-1, 1]; Bz[:, 1:-1, -1] = Bz[:, 1:-1, -2]
+        if self.Ny > 1: Bz[:, 0, :] = Bz[:, 1, :]; Bz[:, -1, :] = Bz[:, -2, :]
+
+    def _enforce_lateral_phi_constant_neumann(self, Phi: torch.Tensor) -> None:
+        if self._bc1_p1 is None: return
+        p1 = self._bc1_p1
+        dx, dy = float(self.dx), float(self.dy)
+        k0 = 1 if Phi.shape[0] > 1 else 0
+        if self.Nx > 1: Phi[k0:, :, 0] = Phi[k0:, :, 1] + p1 * dx; Phi[k0:, :, -1] = Phi[k0:, :, -2] + p1 * dx
+        if self.Ny > 1: Phi[k0:, 0, :] = Phi[k0:, 1, :]; Phi[k0:, -1, :] = Phi[k0:, -2, :] + p1 * dy
+
+    def _enforce_lateral_az_dirichlet_zero(self, Az: torch.Tensor) -> None:
+        if self.Nx > 1: Az[:, :, 0] = 0.0; Az[:, :, -1] = 0.0
+        if self.Ny > 1: Az[:, 0, :] = 0.0; Az[:, -1, :] = 0.0
+
+    def _enforce_top_source_surface(self, B: torch.Tensor) -> None:
+        if self.Nz < 2: return
+        B[0, -1] = 0.0; B[1, -1] = 0.0; B[2, -1] = B[2, -2]
+
+    # =================================================================
+    # Boundary enforcement  (Step 3 — every iteration)
+    # =================================================================
+    def _apply_boundary_conditions(self, B, J):
+        if self._lateral_wall == "BC1":
+            self._enforce_lateral_bz_homogeneous_neumann(B[2])
+            self._enforce_top_source_surface(B)
+        elif self._pin_potential_boundaries and self.B_pot is not None:
+            B[:, :, :, 0] = self.B_pot[:, :, :, 0]
+            B[:, :, :, -1] = self.B_pot[:, :, :, -1]
+            B[:, :, 0, :] = self.B_pot[:, :, 0, :]
+            B[:, :, -1, :] = self.B_pot[:, :, -1, :]
+            B[:, -1] = self.B_pot[:, -1]
+
+        J[:, :, :, 0] = 0
+        J[:, :, :, -1] = 0
+        J[:, :, 0, :] = 0
+        J[:, :, -1, :] = 0
+        J[:, -1] = 0
+
+        # Note: B = B_pot + B_c. Since B_pot[z=0] = Bz_obs and B_c[z=0] = 0,
+        # explicitly pinning it ensures exact precision.
+        B[2, 0] = self.Bz_obs
+        J[2, 0] = self.Jz_obs
+
+    def _compute_top_down_hybrid_scalar_maps(self):
+        """
+        Observation-driven PT scalar maps for the hybrid DPT-NLFFF initializer.
+
+        T is represented by the bottom toroidal potential Az_bottom
+        (nabla_xy^2 Az = -Jz).  When Bx_obs/By_obs are available, S_tilde is
+        derived from div_t(B_obs,t - B_pot,t); otherwise a zero guide map is
+        used and pairing falls back to geometric/current-strength matching.
+        """
+        if self.Az_bottom is None:
+            raise RuntimeError("Az_bottom is not set. Call set_bottom_boundary() first.")
+
+        T_map = self.Az_bottom.clone()
+        if self.Bx_obs is None or self.By_obs is None or self.B_pot is None:
+            S_tilde_map = torch.zeros_like(T_map)
+            return T_map, S_tilde_map
+
+        Btx = self.Bx_obs - self.B_pot[0, 0]
+        Bty = self.By_obs - self.B_pot[1, 0]
+        div_bt = self._d_dx_2d(Btx) + self._d_dy_2d(Bty)
+        S_tilde_map = self._solve_poisson_2d(div_bt.unsqueeze(0), "neumann").squeeze(0)
+        return T_map, S_tilde_map
+
+    def _find_strong_extrema_2d(
+        self,
+        scalar_map: torch.Tensor,
+        *,
+        sign: int,
+        max_count: int,
+        threshold_quantile: float = 0.985,
+    ):
+        scores = scalar_map * float(sign)
+        positive = scores[scores > 0]
+        if positive.numel() == 0:
+            return []
+
+        q = float(torch.quantile(positive, threshold_quantile).item())
+        floor = float(positive.max().item()) * 0.10
+        threshold = max(q, floor)
+        suppress = max(2, int(round(0.04 * min(self.Nx, self.Ny))))
+
+        work = scores.clone()
+        points = []
+        for _ in range(int(max_count)):
+            flat_idx = int(torch.argmax(work).item())
+            val = float(work.reshape(-1)[flat_idx].item())
+            if not np.isfinite(val) or val < threshold:
+                break
+            iy = flat_idx // self.Nx
+            ix = flat_idx % self.Nx
+            amp = float(scalar_map[iy, ix].item())
+            points.append((iy, ix, amp))
+            y0 = max(0, iy - suppress)
+            y1 = min(self.Ny, iy + suppress + 1)
+            x0 = max(0, ix - suppress)
+            x1 = min(self.Nx, ix + suppress + 1)
+            work[y0:y1, x0:x1] = -torch.inf
+        return points
+
+    def _pair_mfr_footpoints(self, maxima, minima, S_tilde_map: torch.Tensor, max_mfr: int):
+        pairs = []
+        used_min = set()
+        for p in maxima:
+            if len(pairs) >= int(max_mfr):
+                break
+            py, px, pamp = p
+            best = None
+            best_score = None
+            for j, q in enumerate(minima):
+                if j in used_min:
+                    continue
+                qy, qx, qamp = q
+                dist2 = float((py - qy) ** 2 + (px - qx) ** 2)
+                hook_bonus = abs(float(S_tilde_map[qy, qx].item())) + abs(float(S_tilde_map[py, px].item()))
+                strength = abs(float(pamp)) + abs(float(qamp))
+                score = dist2 / (strength + 1e-12) - 0.01 * hook_bonus
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best = (j, q)
+            if best is None:
+                continue
+            j, q = best
+            used_min.add(j)
+            pairs.append((p, q))
+        return pairs
+
+    def _add_gaussian_segment_mask(self, mask: torch.Tensor, p0, p1, radius: float) -> torch.Tensor:
+        yy = torch.arange(self.Ny, device=self.device, dtype=self.dtype).view(-1, 1)
+        xx = torch.arange(self.Nx, device=self.device, dtype=self.dtype).view(1, -1)
+        y0, x0 = float(p0[0]), float(p0[1])
+        y1, x1 = float(p1[0]), float(p1[1])
+        vy = y1 - y0
+        vx = x1 - x0
+        denom = vx * vx + vy * vy
+        if denom <= 1e-12:
+            dist2 = (yy - y0) ** 2 + (xx - x0) ** 2
+        else:
+            t = torch.clamp(((xx - x0) * vx + (yy - y0) * vy) / denom, 0.0, 1.0)
+            proj_x = x0 + t * vx
+            proj_y = y0 + t * vy
+            dist2 = (yy - proj_y) ** 2 + (xx - proj_x) ** 2
+        tube = torch.exp(-0.5 * dist2 / (radius * radius))
+        return torch.maximum(mask, tube)
+
+    def _compute_top_down_hybrid_jz_volume(self, *, max_mfr: int = 5):
+        T_map, S_tilde_map = self._compute_top_down_hybrid_scalar_maps()
+        n_candidates = max(2 * int(max_mfr), int(max_mfr))
+        maxima = self._find_strong_extrema_2d(T_map, sign=1, max_count=n_candidates)
+        minima = self._find_strong_extrema_2d(T_map, sign=-1, max_count=n_candidates)
+        pairs = self._pair_mfr_footpoints(maxima, minima, S_tilde_map, max_mfr=max_mfr)
+
+        mfr_mask = torch.zeros(self.Ny, self.Nx, device=self.device, dtype=self.dtype)
+        radius = max(2.0, 0.035 * float(min(self.Nx, self.Ny)))
+        for p, q in pairs:
+            mfr_mask = self._add_gaussian_segment_mask(mfr_mask, p, q, radius)
+        mfr_mask = torch.clamp(mfr_mask, 0.0, 1.0)
+
+        J_mfr_bottom = self.Jz_obs * mfr_mask
+        J_sma_bottom = self.Jz_obs - J_mfr_bottom
+
+        z = torch.arange(self.Nz, device=self.device, dtype=self.dtype)
+        z_norm = z / max(1, self.Nz - 1)
+        cap = torch.clamp(1.0 - z_norm, min=0.0)
+        mfr_env = torch.exp(-z_norm / 0.35) * cap
+        sma_env = torch.exp(-z_norm / 0.12) * cap
+        mfr_env[0] = 1.0
+        sma_env[0] = 1.0
+        if self.Nz > 1:
+            mfr_env[-1] = 0.0
+            sma_env[-1] = 0.0
+
+        Jz = mfr_env[:, None, None] * J_mfr_bottom + sma_env[:, None, None] * J_sma_bottom
+        Jz[0] = self.Jz_obs
+        if self.Nz > 1:
+            Jz[-1] = 0.0
+
+        self._init_diagnostics = {
+            "init_mode": "top_down_hybrid_dpt_nlfff",
+            "mfr_count": len(pairs),
+            "mfr_pairs_yx": [((p[0], p[1]), (q[0], q[1])) for p, q in pairs],
+            "max_mfr": int(max_mfr),
+            "has_s_tilde_from_tangential_obs": self.Bx_obs is not None and self.By_obs is not None,
+        }
+        return Jz
+
+    # =================================================================
+    # Initial conditions  (Step 4)
+    # =================================================================
+    def _build_curl_free_current_initial_state(self, jz_bottom: torch.Tensor):
+        """Build the Fortran-aligned CFCF state for an arbitrary bottom Jz.
+
+        The potential background remains fixed by the observed bottom Bz. The
+        supplied bottom current is harmonically extended through the padded
+        calculation domain, then the same Az and bjt00 reconstruction used by
+        the standard CFCF initializer is applied.
+        """
+        jz_bottom = jz_bottom.to(device=self.device, dtype=self.dtype)
+        if tuple(jz_bottom.shape) != (self.Ny, self.Nx):
+            raise ValueError(
+                f"jz_bottom must have shape ({self.Ny}, {self.Nx}); got {tuple(jz_bottom.shape)}"
+            )
+
+        zeros = torch.zeros(self.Nz, self.Ny, self.Nx, device=self.device, dtype=self.dtype)
+        z_top = torch.zeros(self.Ny, self.Nx, device=self.device, dtype=self.dtype)
+        Jz = self._solve_poisson_3d(zeros, "dirichlet", jz_bottom, "dirichlet", z_top)
+
+        Az = self._solve_poisson_2d(-Jz, "dirichlet")
+        Az[0] = self._solve_poisson_2d((-jz_bottom).unsqueeze(0), "dirichlet").squeeze(0)
+        if self.Nz > 1:
+            Az[-1] = 0.0
+        if self._lateral_wall == "BC1":
+            self._enforce_lateral_az_dirichlet_zero(Az)
+
+        Phi_c = zeros.clone()
+        Bc_z = zeros.clone()
+        Phi_total = self.Phi_pot if self.Phi_pot is not None else Phi_c
+        Bz_total = self.B_pot[2] if self.B_pot is not None else Bc_z
+        if self._fortran_bjt00:
+            Bx_total, By_total, Jx, Jy = self._compute_bjt00_fortran_like(
+                Phi_total, Az, Bz_total
+            )
+            Bcx = Bx_total - self.B_pot[0] if self.B_pot is not None else Bx_total
+            Bcy = By_total - self.B_pot[1] if self.B_pot is not None else By_total
+        else:
+            Bcx, Bcy = self._compute_B_horizontal(Phi_c, Az)
+            Jx, Jy = self._compute_J_horizontal(Phi_total, Az, Bz_total)
+
+        B_c = torch.stack([Bcx, Bcy, Bc_z])
+        J = torch.stack([Jx, Jy, Jz])
+        B = self.B_pot + B_c
+        self._apply_boundary_conditions(B, J)
+        B[2, 0] = self.Bz_obs
+        J[2, 0] = jz_bottom
+        return B, J, Phi_c, Az, B_c
+
+    def compute_initial_conditions(
+        self,
+        *,
+        init_mode: InitialConditionMode = "curl_free_current",
+        auto_rbsl_field_mode: AutoRbslFieldMode = "direct",
+        auto_rbsl_include_residual_current: bool = True,
+        max_mfr: int = 5,
+        mfr_override: Optional[list] = None,
+        axis_n_pts: int = 64,
+        height_frac: float = 1.0,
+        min_sep_px: Optional[int] = None,
+        radius_frac: float = 0.25,
+        parameter_mode: RbslParameterMode = "paper_force_free",
+        chunk_size: Optional[int] = None,
+        work_dtype: Optional[torch.dtype] = None,
+        rbsl_kernel_mode: RbslKernelMode = "paper",
+        rbsl_backend: RbslBackend = "torch",
+        axis_mode: RbslAxisMode = "jhook_pil",
+        use_mirror_path: bool = True,
+        jhook_quantile: float = 0.80,
+        jhook_search_radius_frac: float = 0.35,
+        jhook_search_radius_px: Optional[float] = None,
+        jhook_min_component_px: int = 4,
+        pil_corridor_width_frac: float = 0.40,
+        pil_corridor_width_px: Optional[float] = None,
+        pil_n_ctrl: int = 9,
+        pil_smooth_passes: int = 2,
+        jhook_arc_fit_samples: int = 100,
+        height_optimize: bool = False,
+        height_scan_mode: str = "prefilter",
+        height_scan_values: Optional[list] = None,
+        height_scan_min: float = 0.25,
+        height_scan_max: float = 1.25,
+        height_scan_n: int = 9,
+        height_prefilter_top: int = 3,
+        fit_footpoint_current: bool = True,
+        current_fit_i_scale_min: float = 0.25,
+        current_fit_i_scale_max: float = 8.0,
+        n_ropes: Optional[int] = None,
+        rbsl_override: Optional[list] = None,
+        **deprecated_kwargs,
+    ):
+        """
+        Build initial fields for iteration.
+
+        init_mode:
+        - "curl_free_current": keep legacy behavior (initialize B with potential background
+            plus the current-induced horizontal field computed from the curl-free current field).
+        - "potential": initialize from potential field only (B = B_pot, J = 0, B_c = 0).
+        - "top_down_hybrid_dpt_nlfff": split the bottom PT current map into up to
+            five dominant MFR footprints and a residual SMA current system, then
+            build a Bz-preserving current-induced initial field for fast relaxation.
+        """
+        if deprecated_kwargs or n_ropes is not None or rbsl_override is not None:
+            warnings.warn(
+                "Legacy RBSL init options are removed; use init_mode='auto_rbsl'.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if rbsl_override is not None and mfr_override is None:
+            mfr_override = rbsl_override
+
+        if self.B_pot is None:
+            raise RuntimeError("Background potential field (B_pot) is not set. Call set_bottom_boundary() first.")
+
+        mode = str(init_mode).lower().replace("-", "_")
+        if mode in ("top_down_hybrid_dpt", "hybrid_dpt_nlfff", "dpt_nlfff"):
+            mode = "top_down_hybrid_dpt_nlfff"
+        if mode == "rbsl":
+            raise ValueError("init_mode 'rbsl' was removed; use init_mode='auto_rbsl'.")
+        if mode not in ("curl_free_current", "potential", "top_down_hybrid_dpt_nlfff", "auto_rbsl"):
+            raise ValueError(
+                "init_mode must be 'curl_free_current', 'potential', or "
+                "'auto_rbsl'"
+            )
+        if mode == "auto_rbsl":
+            return self.initialize_auto_rbsl(
+                max_mfr=int(max_mfr),
+                auto_rbsl_field_mode=auto_rbsl_field_mode,
+                include_residual_current=bool(auto_rbsl_include_residual_current),
+                mfr_override=mfr_override,
+                axis_n_pts=int(axis_n_pts),
+                height_frac=float(height_frac),
+                min_sep_px=min_sep_px,
+                radius_frac=float(radius_frac),
+                parameter_mode=parameter_mode,
+                chunk_size=chunk_size,
+                work_dtype=work_dtype,
+                rbsl_kernel_mode=rbsl_kernel_mode,
+                rbsl_backend=rbsl_backend,
+                axis_mode=axis_mode,
+                use_mirror_path=bool(use_mirror_path),
+                jhook_quantile=float(jhook_quantile),
+                jhook_search_radius_frac=float(jhook_search_radius_frac),
+                jhook_search_radius_px=jhook_search_radius_px,
+                jhook_min_component_px=int(jhook_min_component_px),
+                pil_corridor_width_frac=float(pil_corridor_width_frac),
+                pil_corridor_width_px=pil_corridor_width_px,
+                pil_n_ctrl=int(pil_n_ctrl),
+                pil_smooth_passes=int(pil_smooth_passes),
+                jhook_arc_fit_samples=int(jhook_arc_fit_samples),
+                height_optimize=bool(height_optimize),
+                height_scan_mode=height_scan_mode,
+                height_scan_values=height_scan_values,
+                height_scan_min=float(height_scan_min),
+                height_scan_max=float(height_scan_max),
+                height_scan_n=int(height_scan_n),
+                height_prefilter_top=int(height_prefilter_top),
+                fit_footpoint_current=bool(fit_footpoint_current),
+                current_fit_i_scale_min=float(current_fit_i_scale_min),
+                current_fit_i_scale_max=float(current_fit_i_scale_max),
+            )
+
+        zeros = torch.zeros(self.Nz, self.Ny, self.Nx, device=self.device, dtype=self.dtype)
+
+        # Current-induced state variables (stored/iterated by the algorithm)
+        Bc_z = zeros.clone()
+        Phi_c = zeros.clone()
+
+        if mode == "potential":
+            Az = zeros.clone()
+            B_c = torch.zeros((3, self.Nz, self.Ny, self.Nx), device=self.device, dtype=self.dtype)
+            J = torch.zeros((3, self.Nz, self.Ny, self.Nx), device=self.device, dtype=self.dtype)
+            B = self.B_pot.clone()
+            self._apply_boundary_conditions(B, J)
+            self._init_diagnostics = {"init_mode": "potential", "mfr_count": 0}
+            return B, J, Phi_c, Az, B_c
+
+        if mode == "top_down_hybrid_dpt_nlfff":
+            Jz = self._compute_top_down_hybrid_jz_volume(max_mfr=max_mfr)
+        else:
+            B, J, Phi_c, Az, B_c = self._build_curl_free_current_initial_state(self.Jz_obs)
+            self._init_diagnostics = {"init_mode": "curl_free_current", "mfr_count": 0}
+            return B, J, Phi_c, Az, B_c
+
+        Az = self._solve_poisson_2d(-Jz, "dirichlet")
+        Az[0] = self.Az_bottom
+
+        if self._lateral_wall == "BC1":
+            self._enforce_lateral_az_dirichlet_zero(Az)
+
+        Phi_total = self.Phi_pot + Phi_c if self.Phi_pot is not None else Phi_c
+        Bz_total = self.B_pot[2] + Bc_z if self.B_pot is not None else Bc_z
+        if self._fortran_bjt00:
+            Bx_total, By_total, Jx, Jy = self._compute_bjt00_fortran_like(Phi_total, Az, Bz_total)
+            Bcx = Bx_total - self.B_pot[0] if self.B_pot is not None else Bx_total
+            Bcy = By_total - self.B_pot[1] if self.B_pot is not None else By_total
+        else:
+            Bcx, Bcy = self._compute_B_horizontal(Phi_c, Az)
+            Jx, Jy = self._compute_J_horizontal(Phi_total, Az, Bz_total)
+
+        B_c = torch.stack([Bcx, Bcy, Bc_z])
+        J = torch.stack([Jx, Jy, Jz])
+
+        B = self.B_pot + B_c
+        self._apply_boundary_conditions(B, J)
+        B[2, 0] = self.Bz_obs
+        return B, J, Phi_c, Az, B_c
+
+    # =================================================================
+    # Single iteration step  (Step 5)
+    # =================================================================
+    def iteration_step(
+        self,
+        B,
+        J,
+        Phi_c,
+        Az,
+        B_c,
+        mu=1.0,
+        polarity_mask: str = "both"
+    ):
+        """
+        [Upgraded] Updates only B_c (Current Induced Field) with Polarity Alpha Masking.
+        """
+        J_para = self.compute_parallel_currents(J, B)
+
+        # Polarity Alpha Injection
+        if polarity_mask == "positive":
+            mask = (self.Bz_obs > 0).to(self.dtype)
+            J_para[0, 0] = J[0, 0] * mask
+            J_para[1, 0] = J[1, 0] * mask
+            J_para[2, 0] = J[2, 0] * mask
+        elif polarity_mask == "negative":
+            mask = (self.Bz_obs < 0).to(self.dtype)
+            J_para[0, 0] = J[0, 0] * mask
+            J_para[1, 0] = J[1, 0] * mask
+            J_para[2, 0] = J[2, 0] * mask
+
+        if self.buffer_window is not None:
+            J_para = J_para * self.buffer_window
+
+        # --- 5.1  B_c_z: ∇²(Bc_z) = ∂J_px/∂y - ∂J_py/∂x (Bottom BC = 0)
+        source_Bc_z = self._d_dy_centered(J_para[0]) - self._d_dx_centered(J_para[1])
+        zeros_bot = self._zeros_xy()
+        Bc_z_new = self._solve_poisson_3d(source_Bc_z, "neumann", zeros_bot, "neumann")
+
+        # --- 5.2  Phi_c: ∇²Phi_c = Bc_z (Bottom BC = 0)
+        if self._fortran_phi_total_solve and self.B_pot is not None and self.Phi_pot is not None:
+            Bz_total_for_phi = self.B_pot[2] + Bc_z_new
+            Phi_total_new = self._solve_poisson_2d_skip_bottom(
+                Bz_total_for_phi, "neumann", self.Phi_pot[0]
+            )
+            Phi_c_new = Phi_total_new - self.Phi_pot
+        else:
+            Phi_c_new = self._solve_poisson_2d_skip_bottom(
+                Bc_z_new, "neumann", zeros_bot
+            )
+
+        if self._lateral_wall == "BC1" and not self._poisson_mudpack_like:
+            self._enforce_lateral_phi_constant_neumann(Phi_c_new)
+            Phi_c_new[0] = zeros_bot
+
+        # --- 5.3  J_z: remains same
+        if self._rhs_lap_xy == "spectral":
+            lap_xy_Jpz = self._lap_xy_spectral(J_para[2], bc=self._rhs_lap_xy_spectral_ext)
+        else:
+            lap_xy_Jpz = self._lap_xy(J_para[2])
+
+        if self._rhs_jz_div_chain:
+            div_xy_Jp = self._d_dx_centered(J_para[0]) + self._d_dy_centered(J_para[1])
+            source_Jz = lap_xy_Jpz - self._d_dz_centered(div_xy_Jp)
+        else:
+            d2Jpx_dxdz = self._d2_dxdz(J_para[0])
+            d2Jpy_dydz = self._d2_dydz(J_para[1])
+            source_Jz = lap_xy_Jpz - d2Jpx_dxdz - d2Jpy_dydz
+
+        z_top = zeros_bot
+        Jz_new = self._solve_poisson_3d(source_Jz, "dirichlet", self.Jz_obs, "dirichlet", z_top)
+
+        # --- 5.4  A_z: remains same
+        Az_new = torch.empty_like(Jz_new)
+        Az_new[0] = self.Az_bottom
+        if self.Nz > 1:
+            Jz_for_az = Jz_new[1:].clone()
+            Jz_for_az[-1] = 0.0
+            Jz_for_az[:, :, 0] = 0.0
+            Jz_for_az[:, :, -1] = 0.0
+            Jz_for_az[:, 0, :] = 0.0
+            Jz_for_az[:, -1, :] = 0.0
+            Az_new[1:] = self._solve_poisson_2d(-Jz_for_az, "dirichlet")
+        if self._lateral_wall == "BC1":
+            self._enforce_lateral_az_dirichlet_zero(Az_new)
+
+        # --- 5.5  Horizontal components & Under-relaxation
+        Phi_total_new = self.Phi_pot + Phi_c_new if self.Phi_pot is not None else Phi_c_new
+        Bz_total_new = self.B_pot[2] + Bc_z_new if self.B_pot is not None else Bc_z_new
+        if self._fortran_bjt00:
+            Bx_total_new, By_total_new, Jx_new, Jy_new = self._compute_bjt00_fortran_like(
+                Phi_total_new, Az_new, Bz_total_new
+            )
+            Bcx_new = Bx_total_new - self.B_pot[0] if self.B_pot is not None else Bx_total_new
+            Bcy_new = By_total_new - self.B_pot[1] if self.B_pot is not None else By_total_new
+        else:
+            Bcx_new, Bcy_new = self._compute_B_horizontal(Phi_c_new, Az_new)
+            Jx_new, Jy_new = self._compute_J_horizontal(Phi_total_new, Az_new, Bz_total_new)
+
+        B_c_new = torch.stack([Bcx_new, Bcy_new, Bc_z_new])
+        J_new = torch.stack([Jx_new, Jy_new, Jz_new])
+
+        if mu < 1.0:
+            B_c_new = mu * B_c_new + (1.0 - mu) * B_c
+            J_new = mu * J_new + (1.0 - mu) * J
+
+        # Re-assemble Total Field
+        B_new = self.B_pot + B_c_new
+        self._apply_boundary_conditions(B_new, J_new)
+
+        if self._fortran_bjt00 and self.Nz > 1:
+            Az_new = Az_new.clone()
+            Az_new[-1] = 0.0
+            self._enforce_lateral_az_dirichlet_zero(Az_new)
+
+        return B_new, J_new, Phi_c_new, Az_new, B_c_new
+
+    # =================================================================
+    # Convergence metrics  (Step 6)
+    # =================================================================
+    def _fortran_cwsin_slices(self, B: torch.Tensor):
+        nz, ny, nx = int(B.shape[1]), int(B.shape[2]), int(B.shape[3])
+        if self.fov_slice_yx is not None and self._observed_shape_zyx is not None:
+            nzo, nyo, nxo = self._observed_shape_zyx
+            sy_fov, sx_fov = self.fov_slice_yx
+            bfx = int(sx_fov.start or 0)
+            bfy = int(sy_fov.start or 0)
+            bfz = max(0, nz - int(nzo))
+        else:
+            nzo, nyo, nxo = nz, ny, nx
+            bfx = bfy = bfz = 0
+
+        abfxcw = int(nxo) // 8 + bfx
+        abfycw = int(nyo) // 8 + bfy
+        abfzcw = int(nzo) // 4 + bfz
+        nxm1, nym1, nzm1 = nx - 1, ny - 1, nz - 1
+
+        sz = slice(1, max(1, nzm1 - abfzcw + 1))
+        sy = slice(abfycw, max(abfycw + 1, nym1 - abfycw + 1))
+        sx = slice(abfxcw, max(abfxcw + 1, nxm1 - abfxcw + 1))
+        return sz, sy, sx
+
+    def compute_sigma(self, B, J):
+        sz, sy, sx = self._fortran_cwsin_slices(B)
+        b = B[:, sz, sy, sx]
+        j = J[:, sz, sy, sx]
+        bnorm = torch.linalg.vector_norm(b, dim=0).clamp_min(1.0e-10)
+        jnorm = torch.linalg.vector_norm(j, dim=0)
+        jxb = torch.cross(j.movedim(0, -1), b.movedim(0, -1), dim=-1)
+        numerator = (torch.linalg.vector_norm(jxb, dim=-1) / bnorm).sum()
+        denominator = jnorm.sum().clamp_min(1.0e-30)
+        return (numerator / denominator).item()
+
+    def compute_divB(self, B):
+        divB = self._d_dx_centered(B[0]) + self._d_dy_centered(B[1]) + self._d_dz_centered(B[2])
+        Bm = torch.sqrt(B[0] ** 2 + B[1] ** 2 + B[2] ** 2)
+        delta = min(self.dx, self.dy, self.dz)
+        return (torch.abs(divB).mean() / (6.0 * Bm.mean() / delta + 1e-12)).item()
+
+    def compute_energy(self, B):
+        B2 = B[0] ** 2 + B[1] ** 2 + B[2] ** 2
+        return (B2.sum() * self.dx * self.dy * self.dz / 2.0).item()
+
+    # =================================================================
+    # High-level iteration driver
+    # =================================================================
+    def iterate(
+        self,
+        max_iter=200,
+        tol=1e-5,
+        mu=1.0,
+        patience=1,
+        sigma_improvement_tol: Optional[float] = 1e-5,
+        auto_rbsl_improvement_grace: int = 20,
+        verbose=True,
+        polarity_mask: str = "positive",
+        init_mode: InitialConditionMode = "curl_free_current",
+        auto_rbsl_field_mode: AutoRbslFieldMode = "direct",
+        auto_rbsl_include_residual_current: bool = True,
+        max_mfr: int = 5,
+        mfr_override: Optional[list] = None,
+        axis_n_pts: int = 64,
+        height_frac: float = 1.0,
+        min_sep_px: Optional[int] = None,
+        radius_frac: float = 0.25,
+        chunk_size: Optional[int] = None,
+        work_dtype: Optional[torch.dtype] = None,
+        rbsl_backend: RbslBackend = "torch",
+        axis_mode: RbslAxisMode = "jhook_pil",
+        use_mirror_path: bool = True,
+        jhook_quantile: float = 0.80,
+        jhook_search_radius_frac: float = 0.35,
+        jhook_search_radius_px: Optional[float] = None,
+        jhook_min_component_px: int = 4,
+        pil_corridor_width_frac: float = 0.40,
+        pil_corridor_width_px: Optional[float] = None,
+        pil_n_ctrl: int = 9,
+        pil_smooth_passes: int = 2,
+        jhook_arc_fit_samples: int = 100,
+        per_step_callback: Optional[Callable[[int, float, torch.Tensor, torch.Tensor], None]] = None,
+    ):
+        mode_norm = str(init_mode).lower().replace("-", "_")
+        is_auto_rbsl_init = mode_norm == "auto_rbsl"
+        auto_grace = max(0, int(auto_rbsl_improvement_grace)) if is_auto_rbsl_init else 0
+
+        B, J, Phi_c, Az, B_c = self.compute_initial_conditions(
+            init_mode=init_mode,
+            auto_rbsl_field_mode=auto_rbsl_field_mode,
+            auto_rbsl_include_residual_current=bool(auto_rbsl_include_residual_current),
+            max_mfr=max_mfr,
+            mfr_override=mfr_override,
+            axis_n_pts=axis_n_pts,
+            height_frac=height_frac,
+            min_sep_px=min_sep_px,
+            radius_frac=radius_frac,
+            chunk_size=chunk_size,
+            work_dtype=work_dtype,
+            rbsl_backend=rbsl_backend,
+            axis_mode=axis_mode,
+            use_mirror_path=use_mirror_path,
+            jhook_quantile=jhook_quantile,
+            jhook_search_radius_frac=jhook_search_radius_frac,
+            jhook_search_radius_px=jhook_search_radius_px,
+            jhook_min_component_px=jhook_min_component_px,
+            pil_corridor_width_frac=pil_corridor_width_frac,
+            pil_corridor_width_px=pil_corridor_width_px,
+            pil_n_ctrl=pil_n_ctrl,
+            pil_smooth_passes=pil_smooth_passes,
+            jhook_arc_fit_samples=jhook_arc_fit_samples,
+        )
+
+        sigma0 = self.compute_sigma(B, J)
+        divB0 = self.compute_divB(B)
+        E0 = self.compute_energy(B)
+
+        if verbose:
+            diag = self._init_diagnostics or {}
+            mfr_text = ""
+            if diag.get("init_mode") in ("top_down_hybrid_dpt_nlfff", "auto_rbsl"):
+                mfr_text = f"  MFR={diag.get('mfr_count', 0)}/{diag.get('max_mfr', max_mfr)}"
+            print(
+                f"Initial  sigma={sigma0:.4e}  divB={divB0:.4e}  E={E0:.4e} "
+                f"(Polarity: {polarity_mask}, init: {str(init_mode)}){mfr_text}"
+            )
+
+        history = {"sigma": [], "divB": [], "energy": []}
+        best_sigma = sigma0
+        best_iter = 0
+
+        best_B, best_J = B.clone(), J.clone()
+        best_Phi_c, best_Az = Phi_c.clone(), Az.clone()
+        stall_count = 0
+        # Require consecutive flat steps before sigma_improvement_tol can stop.
+        # A single noisy plateau must not terminate a still-evolving fixed-point
+        # search (especially TD topology near HFT/QSL).
+        improvement_flat_count = 0
+        improvement_flat_required = max(int(patience), 1)
+        prev_sigma = sigma0
+        use_sigma_improvement_stop = (
+            sigma_improvement_tol is not None and float(sigma_improvement_tol) > 0.0
+        )
+        sigma_improvement_eps = (
+            float(sigma_improvement_tol) if use_sigma_improvement_stop else 0.0
+        )
+        last_sigma_improvement = None
+        stop_reason = "max_iter"
+
+        for n in range(1, max_iter + 1):
+            B, J, Phi_c, Az, B_c = self.iteration_step(
+                B, J, Phi_c, Az, B_c, mu=mu, polarity_mask=polarity_mask
+            )
+
+            sigma = self.compute_sigma(B, J)
+            divB = self.compute_divB(B)
+            energy = self.compute_energy(B)
+
+            history["sigma"].append(sigma)
+            history["divB"].append(divB)
+            history["energy"].append(energy)
+
+            if per_step_callback is not None:
+                per_step_callback(n, sigma, B, J)
+
+            sigma_improvement = prev_sigma - sigma
+            last_sigma_improvement = sigma_improvement
+            prev_sigma = sigma
+            if sigma_improvement < sigma_improvement_eps:
+                improvement_flat_count += 1
+            else:
+                improvement_flat_count = 0
+
+            if sigma < best_sigma:
+                best_sigma = sigma
+                best_iter = n
+                best_B, best_J = B.clone(), J.clone()
+                best_Phi_c, best_Az = Phi_c.clone(), Az.clone()
+                stall_count = 0
+            else:
+                stall_count += 1
+
+            if verbose and (n == 1 or n % 10 == 0):
+                print(f"Iter {n:4d} | sigma={sigma:.4e} | divB={divB:.4e} | E={energy:.4e}")
+
+            if sigma < tol:
+                stop_reason = "tol"
+                if verbose:
+                    print(f"Converged at iteration {n}")
+                break
+
+            improvement_stop_allowed = n > auto_grace
+
+            if (
+                improvement_stop_allowed
+                and use_sigma_improvement_stop
+                and improvement_flat_count >= improvement_flat_required
+            ):
+                stop_reason = "sigma_improvement_tol"
+                if verbose:
+                    print(
+                        f"Early stop at iter {n}: sigma improvement flat for "
+                        f"{improvement_flat_count} steps "
+                        f"(last {sigma_improvement:.4e} < {sigma_improvement_eps:.4e}; "
+                        f"best sigma={best_sigma:.4e} at iter {best_iter})"
+                )
+                break
+
+            if improvement_stop_allowed and patience > 0 and stall_count >= patience:
+                stop_reason = "sigma_stall"
+                if verbose:
+                    print(f"Early stop at iter {n}: sigma not improving (best sigma={best_sigma:.4e} at iter {best_iter})")
+                break
+
+        self._B, self._J = best_B, best_J
+        self._Phi_c, self._Az = best_Phi_c, best_Az
+        history["best_sigma"] = best_sigma
+        history["best_iter"] = best_iter
+        history["stop_reason"] = stop_reason
+        history["sigma_improvement_tol"] = (
+            sigma_improvement_eps if use_sigma_improvement_stop else None
+        )
+        history["auto_rbsl_improvement_grace"] = auto_grace
+        history["last_sigma_improvement"] = last_sigma_improvement
+        history["init_diagnostics"] = self._init_diagnostics
+        return history
+
+    def fields_to_numpy(self, *, crop_to_observed_fov: bool = True):
+        if self._B is None or self._J is None:
+            raise RuntimeError("No solution stored; call iterate() first.")
+
+        B = self._B
+        J = self._J
+        if crop_to_observed_fov and self.fov_slice_yx is not None:
+            if self._observed_shape_zyx is not None:
+                nzo, _, _ = self._observed_shape_zyx
+                B = B[:, :nzo]
+                J = J[:, :nzo]
+            sy, sx = self.fov_slice_yx
+            B = B[..., sy, sx]
+            J = J[..., sy, sx]
+
+        return {
+            "Bx": B[0].cpu().numpy(),
+            "By": B[1].cpu().numpy(),
+            "Bz": B[2].cpu().numpy(),
+            "Jx": J[0].cpu().numpy(),
+            "Jy": J[1].cpu().numpy(),
+            "Jz": J[2].cpu().numpy(),
+        }
+
+# =============================================================================
+# STABLE NFPT LAYER
+# =============================================================================
+class StableNFPTSolverGPU(NFPTSolverGPU):
+    """NFPT GPU solver with alpha limiting, T boundary, and safeguarded relaxation."""
+
+    def __init__(
+        self,
+        *args,
+        toroidal_boundary: bool = True,
+        alpha_limit_factor: Optional[float] = 1.0,
+        bottom_jperp_zero: bool = True,
+        relax_scalars: bool = True,
+        ccu_pure_current: bool = False,
+        t_source: str = "jz",
+        t_filter_scale: float = 0.0,
+        bottom_imprint_robin_weight: float = 0.0,
+        **kwargs,
+    ):
+        kwargs.setdefault("rhs_jz_div_chain", False)
+        kwargs.setdefault("poisson_z_order", 2)
+        kwargs.setdefault("poisson_z_backend", "thomas")
+        super().__init__(*args, **kwargs)
+        self._toroidal_boundary = bool(toroidal_boundary)
+        self._alpha_limit_factor = (
+            None if alpha_limit_factor is None else float(alpha_limit_factor)
+        )
+        self._bottom_jperp_zero = bool(bottom_jperp_zero)
+        self._relax_scalars = bool(relax_scalars)
+        self._ccu_pure_current = bool(ccu_pure_current)
+        if t_source not in ("jz", "helmholtz"):
+            raise ValueError(f"t_source must be 'jz' or 'helmholtz', got {t_source!r}")
+        self._t_source = t_source
+        self._t_filter_scale = float(t_filter_scale)
+        rho = float(bottom_imprint_robin_weight)
+        if not 0.0 <= rho <= 1.0:
+            raise ValueError("bottom_imprint_robin_weight must be between 0 and 1")
+        if rho > 0.0:
+            if self._poisson_z_order != 2 or self._poisson_xy_order != 2:
+                raise ValueError(
+                    "Stable-Robin requires second-order horizontal and vertical "
+                    "Poisson operators"
+                )
+            if not self._poisson_mudpack_like:
+                raise ValueError(
+                    "Stable-Robin requires poisson_mudpack_like=True"
+                )
+            if self._fortran_phi_total_solve:
+                raise ValueError(
+                    "Stable-Robin is incompatible with fortran_phi_total_solve=True"
+                )
+            if self._lateral_wall != "BC1":
+                raise ValueError("Stable-Robin currently requires lateral_wall='BC1'")
+            if self.Nz < 3:
+                raise ValueError("Stable-Robin requires Nz >= 3")
+        self.bottom_imprint_robin_weight = rho
+        self._bottom_imprint_dphi_target: Optional[torch.Tensor] = None
+        self._bottom_imprint_divergence_target: Optional[torch.Tensor] = None
+        self.bottom_imprint_diagnostics: Optional[dict] = None
+        self.Jz_toroidal_boundary: Optional[torch.Tensor] = None
+        self.toroidal_boundary_diagnostics: Optional[dict] = None
+
+    # -----------------------------------------------------------------
+    # 1. Bounded force-free alpha
+    # -----------------------------------------------------------------
+    def alpha_max(self) -> Optional[float]:
+        """Grid-resolvability bound on |alpha| (None when limiting disabled)."""
+        if self._alpha_limit_factor is None:
+            return None
+        h = min(float(self.dx), float(self.dy), float(self.dz))
+        return self._alpha_limit_factor / h
+
+    def compute_parallel_currents(self, J, B):
+        B2 = torch.clamp(B[0] ** 2 + B[1] ** 2 + B[2] ** 2, min=1e-20)
+        alpha = (J[0] * B[0] + J[1] * B[1] + J[2] * B[2]) / B2
+        am = self.alpha_max()
+        if am is not None and math.isfinite(am):
+            alpha = torch.clamp(alpha, min=-am, max=am)
+        return torch.stack([alpha * B[0], alpha * B[1], alpha * B[2]])
+
+    # -----------------------------------------------------------------
+    # 3. MBSL toroidal-scalar boundary
+    # -----------------------------------------------------------------
+    def _helmholtz_toroidal_scalar(self) -> Optional[torch.Tensor]:
+        """T from the MBSL Sect. 3.2 Helmholtz decomposition of B_tilde_t.
+
+        B_tilde_t = B_t,obs - B_pot,t is curl-decomposed directly:
+        ``lap_xy T = -z.(curl B_tilde_t)``.  Subtracting the potential
+        tangential field first removes its finite-difference curl residual
+        from the boundary current (it is zero in the continuum), instead of
+        letting it enter through the raw ``Jz_obs`` stencil.
+        """
+        if self.Bx_obs is None or self.By_obs is None or self.B_pot is None:
+            return None
+        Btx = self.Bx_obs - self.B_pot[0, 0]
+        Bty = self.By_obs - self.B_pot[1, 0]
+        jz_tilde = self._d_dx_2d(Bty) - self._d_dy_2d(Btx)
+        return self._solve_poisson_2d((-jz_tilde).unsqueeze(0), "dirichlet").squeeze(0)
+
+    def _tikhonov_filter_T(self, T2d: torch.Tensor) -> torch.Tensor:
+        """Spectral Tikhonov filter ``T_k <- T_k / (1 + s^2 k^2)``.
+
+        Minimizing ``|curl(T z) - B_tilde_t,rot|^2 + s^2 |lap_xy T|^2``
+        (field-level data fidelity + implied-current energy penalty) per
+        endpoint-Dirichlet eigenmode ``lam_k = -k^2`` gives exactly this
+        low-pass on T; the implied bottom current is filtered with cutoff
+        length ``s`` while the tangential-field content of T is preserved
+        at large scales.
+        """
+        s2 = self._t_filter_scale ** 2
+        if s2 <= 0.0 or self.Nx < 3 or self.Ny < 3:
+            return T2d
+        lam = self._dirichlet_lam_xy_interior()
+        T = T2d.clone()
+        t_hat = self._dst1(self._dst1(T2d[1:-1, 1:-1], -1), -2)
+        t_hat = t_hat / (1.0 + s2 * (-lam.to(dtype=t_hat.dtype)))
+        T[1:-1, 1:-1] = self._idst1(self._idst1(t_hat, -1), -2)
+        return T
+
+    def set_bottom_boundary(self, *args, **kwargs):
+        out = super().set_bottom_boundary(*args, **kwargs)
+        # Az_bottom = T already solves lap_xy T = -Jz_obs with endpoint
+        # Dirichlet walls (consistent with BC1's Az = 0 lateral condition).
+        if self._t_source == "helmholtz":
+            T_helm = self._helmholtz_toroidal_scalar()
+            if T_helm is not None:
+                self.Az_bottom = T_helm.clone()
+            else:
+                warnings.warn(
+                    "t_source='helmholtz' requires Bx_obs/By_obs and B_pot; "
+                    "falling back to the Jz-based toroidal scalar."
+                )
+        if self._t_filter_scale > 0.0:
+            self.Az_bottom = self._tikhonov_filter_T(self.Az_bottom)
+        Jz_T = -self._lap_xy(self.Az_bottom.unsqueeze(0))[0]
+        if self.Nx > 1:
+            Jz_T[:, 0] = 0.0
+            Jz_T[:, -1] = 0.0
+        if self.Ny > 1:
+            Jz_T[0, :] = 0.0
+            Jz_T[-1, :] = 0.0
+        self.Jz_toroidal_boundary = Jz_T
+        self.toroidal_boundary_diagnostics = {
+            "t_source": self._t_source,
+            "t_filter_scale": self._t_filter_scale,
+            "raw_jz_rms": float(torch.sqrt((self.Jz_obs**2).mean()).item()),
+            "t_implied_jz_rms": float(torch.sqrt((Jz_T**2).mean()).item()),
+            "raw_vs_t_implied_jz_rms": float(
+                torch.sqrt(((self.Jz_obs - Jz_T) ** 2).mean()).item()
+            ),
+        }
+        self._configure_bottom_imprint_robin_target()
+        return out
+
+    def _configure_bottom_imprint_robin_target(self) -> None:
+        """Build the representable ``d_z Phi_c`` target from observed ``B_h``.
+
+        Stable NFPT assigns the complete observed normal field to ``B_pot`` and
+        retains ``Phi_c(0)=0``.  The optional mixed-Robin condition therefore
+        constrains only the residual poloidal horizontal field
+
+        ``B_h,obs - B_h,pot``.
+
+        For ``B_h^P = -grad_h(d_z Phi_c)``, its divergence gives
+        ``lap_xy(d_z Phi_c) = -div_h(B_h^P)``.  The endpoint-Neumann zero mode
+        is not representable and is explicitly projected out.
+        """
+        self._bottom_imprint_dphi_target = None
+        self._bottom_imprint_divergence_target = None
+        self.bottom_imprint_diagnostics = {
+            "bottom_imprint_robin_weight": self.bottom_imprint_robin_weight,
+            "enabled": self.bottom_imprint_robin_weight > 0.0,
+        }
+        if self.bottom_imprint_robin_weight == 0.0:
+            return
+        if self.Bx_obs is None or self.By_obs is None or self.B_pot is None:
+            raise ValueError(
+                "bottom_imprint_robin_weight > 0 requires Bx_obs, By_obs, and "
+                "Bz_obs; call set_bottom_vector_boundary()"
+            )
+
+        residual_bx = self.Bx_obs - self.B_pot[0, 0]
+        residual_by = self.By_obs - self.B_pot[1, 0]
+        divergence = self._d_dx_2d(residual_bx) + self._d_dy_2d(residual_by)
+        divergence_hat = self._dct1(self._dct1(divergence, -1), -2)
+        lam = self._endpoint_neumann_lam_xy().to(dtype=divergence_hat.dtype)
+        lam_safe = lam.clone()
+        lam_safe[0, 0] = 1.0
+        derivative_hat = -divergence_hat / lam_safe
+        removed_zero_mode = derivative_hat[0, 0].clone()
+        derivative_hat[0, 0] = 0.0
+        derivative = self._idct1(self._idct1(derivative_hat, -1), -2)
+
+        self._bottom_imprint_dphi_target = derivative
+        self._bottom_imprint_divergence_target = divergence
+        reconstructed = -self._lap_xy(derivative.unsqueeze(0))[0]
+        scale = torch.clamp(torch.sqrt(torch.mean(divergence**2)), min=1.0e-30)
+        self.bottom_imprint_diagnostics.update(
+            {
+                "target_dphi_rms": float(
+                    torch.sqrt(torch.mean(derivative**2)).item()
+                ),
+                "target_divergence_rms": float(scale.item()),
+                "representable_divergence_relative_error": float(
+                    (
+                        torch.sqrt(torch.mean((reconstructed - divergence) ** 2))
+                        / scale
+                    ).item()
+                ),
+                "removed_dphi_zero_mode": float(removed_zero_mode.item()),
+            }
+        )
+
+    def _solve_phi_c_bottom_imprint_robin(
+        self, source_bcz: torch.Tensor
+    ) -> torch.Tensor:
+        """Solve the Stable-NFPT poloidal equation with a weighted bottom row.
+
+        The stable decomposition remains unchanged: ``Phi_c(0)=0`` and hence
+        ``Bc_z(0)=0``.  Per nonzero endpoint-Neumann horizontal mode, solve
+
+        ``(d_zz + lambda_h) Phi_c = source_Bcz / lambda_h``
+
+        with the original homogeneous top-Neumann closure.  Only the first
+        interior row is blended with the observed bottom derivative condition.
+        """
+        if self._bottom_imprint_dphi_target is None:
+            raise RuntimeError("Stable-Robin bottom derivative target is unavailable")
+        if tuple(source_bcz.shape) != (self.Nz, self.Ny, self.Nx):
+            raise ValueError(
+                f"source_bcz must have shape {(self.Nz, self.Ny, self.Nx)}; "
+                f"got {tuple(source_bcz.shape)}"
+            )
+
+        rho = self.bottom_imprint_robin_weight
+        source_hat = self._dct1(self._dct1(source_bcz, -1), -2)
+        lam = self._endpoint_neumann_lam_xy().to(dtype=source_hat.dtype)
+        lam_safe = lam.clone()
+        lam_safe[0, 0] = 1.0
+        rhs_hat = source_hat / lam_safe[None, :, :]
+        rhs_hat[:, 0, 0] = 0.0
+        derivative_hat = self._dct1(
+            self._dct1(self._bottom_imprint_dphi_target, -1), -2
+        )
+        derivative_hat[0, 0] = 0.0
+
+        dz = float(self.dz)
+        dz2 = dz * dz
+        lower_pde = 1.0 / dz2
+        upper_pde = 1.0 / dz2
+        diag_pde = lam - 2.0 / dz2
+        n_unknown = self.Nz - 1
+        cprime = torch.empty(
+            (n_unknown, self.Ny, self.Nx),
+            device=self.device,
+            dtype=rhs_hat.dtype,
+        )
+        dprime = torch.empty_like(cprime)
+
+        # Phi_c(0)=0, so the known-bottom contribution vanishes.  The
+        # coefficients are the same mixed row used by NFGS, while the final
+        # row below retains Stable-NFPT's mirrored-ghost top Neumann closure.
+        first_diag = (1.0 - rho) * lam - 2.0 / dz2
+        first_upper = (1.0 - 0.5 * rho) / dz2
+        first_rhs = (1.0 - rho) * rhs_hat[1] - rho * derivative_hat / dz
+        cprime[0] = first_upper / first_diag
+        dprime[0] = first_rhs / first_diag
+
+        for row in range(1, n_unknown):
+            is_top = row == n_unknown - 1
+            lower = 2.0 * lower_pde if is_top else lower_pde
+            upper = 0.0 if is_top else upper_pde
+            denom = diag_pde - lower * cprime[row - 1]
+            cprime[row] = upper / denom
+            dprime[row] = (
+                rhs_hat[row + 1] - lower * dprime[row - 1]
+            ) / denom
+
+        solution_hat = torch.zeros_like(rhs_hat)
+        solution_hat[-1] = dprime[-1]
+        for row in range(n_unknown - 2, -1, -1):
+            solution_hat[row + 1] = (
+                dprime[row] - cprime[row] * solution_hat[row + 2]
+            )
+        solution_hat[:, 0, 0] = 0.0
+        phi_c = self._idct1(self._idct1(solution_hat, -1), -2)
+        phi_c[0] = 0.0
+        return phi_c
+
+    def compute_bottom_imprint_diagnostics(
+        self,
+        B: Optional[torch.Tensor] = None,
+        Phi_c: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Measure the active Stable-Robin derivative and boundary residuals."""
+        diagnostics = dict(self.bottom_imprint_diagnostics or {})
+        diagnostics.setdefault(
+            "bottom_imprint_robin_weight", self.bottom_imprint_robin_weight
+        )
+        diagnostics.setdefault("enabled", self.bottom_imprint_robin_weight > 0.0)
+        phi = self._Phi_c if Phi_c is None else Phi_c
+        field = self._B if B is None else B
+        if (
+            phi is None
+            or self._bottom_imprint_dphi_target is None
+            or phi.shape[0] < 3
+        ):
+            diagnostics["bottom_dphi_residual_rms"] = None
+        else:
+            derivative = (
+                -3.0 * phi[0] + 4.0 * phi[1] - phi[2]
+            ) / (2.0 * float(self.dz))
+            diagnostics["bottom_dphi_residual_rms"] = float(
+                torch.sqrt(
+                    torch.mean(
+                        (derivative - self._bottom_imprint_dphi_target) ** 2
+                    )
+                ).item()
+            )
+        if (
+            field is None
+            or self.Bx_obs is None
+            or self.By_obs is None
+        ):
+            diagnostics["bottom_horizontal_divergence_rms"] = None
+            diagnostics["bottom_horizontal_divergence_relative"] = None
+        else:
+            observed_divergence = self._d_dx_2d(
+                self.Bx_obs
+            ) + self._d_dy_2d(self.By_obs)
+            final_divergence = self._d_dx_2d(
+                field[0, 0]
+            ) + self._d_dy_2d(field[1, 0])
+            residual = final_divergence - observed_divergence
+            scale = torch.clamp(
+                torch.sqrt(torch.mean(observed_divergence**2)), min=1.0e-30
+            )
+            diagnostics["bottom_horizontal_divergence_rms"] = float(
+                torch.sqrt(torch.mean(residual**2)).item()
+            )
+            diagnostics["bottom_horizontal_divergence_relative"] = float(
+                (torch.sqrt(torch.mean(residual**2)) / scale).item()
+            )
+        return diagnostics
+
+    def _bottom_jz_bc(self) -> torch.Tensor:
+        if self._toroidal_boundary and self.Jz_toroidal_boundary is not None:
+            return self.Jz_toroidal_boundary
+        return self.Jz_obs
+
+    def _apply_boundary_conditions(self, B, J):
+        super()._apply_boundary_conditions(B, J)
+        J[2, 0] = self._bottom_jz_bc()
+
+    def _dirichlet_lam_xy_interior(self) -> torch.Tensor:
+        """Eigenvalues of the endpoint-Dirichlet horizontal Laplacian."""
+        return super()._dirichlet_lam_xy_interior()
+
+    def _solve_az_from_jz_poisson_source(self, source_jz: torch.Tensor) -> torch.Tensor:
+        """
+        Solve the NFPT stationary toroidal update directly for ``A_z``.
+
+        ``lap_3d(J_z) = S_J`` with ``J_z = -lap_xy A_z`` becomes, per
+        horizontal endpoint-Dirichlet eigenmode ``lam_m < 0``,
+
+            (d_zz + lam_m) A_m = -S_m / lam_m,
+            A_m(0) = T_m,  A_m(z_top) = 0.
+        """
+        Az = torch.zeros_like(source_jz)
+        Az[0] = self.Az_bottom
+        if self.Nz > 1:
+            Az[-1] = 0.0
+        if self.Nx < 3 or self.Ny < 3:
+            return Az
+
+        rhs = source_jz[:, 1:-1, 1:-1]
+        source_hat = self._dst1(self._dst1(rhs, -1), -2)
+        lam_xy = self._dirichlet_lam_xy_interior()
+        rhs_hat = -source_hat / lam_xy.to(dtype=source_hat.dtype)
+
+        bottom_hat = self._cached_boundary_hat_dst_interior(self.Az_bottom)
+        top_hat = self._cached_boundary_hat_dst_interior(self._zeros_xy())
+        if self._poisson_z_order == 4:
+            az_hat = _pentadiag_solve_batched(
+                rhs_hat, bottom_hat, lam_xy, float(self.dz), True, top_hat
+            )
+        elif self._poisson_z_backend == "pcr":
+            az_hat = _pcr_solve_batched(
+                rhs_hat, bottom_hat, lam_xy, float(self.dz), True, top_hat
+            )
+        else:
+            az_hat = _thomas_solve_batched_lowmem(
+                rhs_hat, bottom_hat, lam_xy, float(self.dz), True, top_hat
+            )
+
+        Az[:, 1:-1, 1:-1] = self._idst1(self._idst1(az_hat, -1), -2)
+        Az[0] = self.Az_bottom
+        if self.Nz > 1:
+            Az[-1] = 0.0
+        if self._lateral_wall == "BC1":
+            self._enforce_lateral_az_dirichlet_zero(Az)
+        return Az
+
+    # -----------------------------------------------------------------
+    # Scalar-consistent state reconstruction
+    # -----------------------------------------------------------------
+    def _reconstruct_state_from_scalars(self, Phi_c, Az, Bc_z):
+        """Rebuild B_c and J from the PT scalars; J_z = -lap_xy A_z exactly.
+
+        With ``ccu_pure_current`` the horizontal current is evaluated from the
+        current-carrying scalars only.  This is exact in the continuum
+        (``curl B_pot = 0`` and ``lap_3d Phi_pot = 0``) and removes the
+        discretization currents of the dominant potential background from J.
+        It is optional and is disabled in the default stable profile.
+        """
+        Phi_total = self.Phi_pot + Phi_c if self.Phi_pot is not None else Phi_c
+        Bz_total = self.B_pot[2] + Bc_z if self.B_pot is not None else Bc_z
+        if self._fortran_bjt00:
+            Bx_total, By_total, Jx, Jy = self._compute_bjt00_fortran_like(
+                Phi_total, Az, Bz_total
+            )
+            Bcx = Bx_total - self.B_pot[0] if self.B_pot is not None else Bx_total
+            Bcy = By_total - self.B_pot[1] if self.B_pot is not None else By_total
+            if self._ccu_pure_current and self.B_pot is not None:
+                _, _, Jx, Jy = self._compute_bjt00_fortran_like(Phi_c, Az, Bc_z)
+        else:
+            Bcx, Bcy = self._compute_B_horizontal(Phi_c, Az)
+            if self._ccu_pure_current and self.B_pot is not None:
+                Jx, Jy = self._compute_J_horizontal(Phi_c, Az, Bc_z)
+            else:
+                Jx, Jy = self._compute_J_horizontal(Phi_total, Az, Bz_total)
+        Jz = -self._lap_xy(Az)
+        B_c = torch.stack([Bcx, Bcy, Bc_z])
+        J = torch.stack([Jx, Jy, Jz])
+        B = self.B_pot + B_c
+        self._apply_boundary_conditions(B, J)
+        return B, J, B_c
+
+    def compute_initial_conditions(
+        self,
+        *,
+        init_mode="curl_free_current",
+        max_mfr: int = 5,
+        auto_rbsl_field_mode: str = "direct",
+        auto_rbsl_include_residual_current: bool = True,
+        **auto_rbsl_kwargs,
+    ):
+        mode = str(init_mode).lower().replace("-", "_")
+        if (
+            self.bottom_imprint_robin_weight > 0.0
+            and mode not in ("curl_free_current", "potential")
+        ):
+            raise ValueError(
+                "Stable-Robin currently supports init_mode='curl_free_current' "
+                "or 'potential'; observation-seeded initializers require a "
+                "separate boundary-consistent projection"
+            )
+        field_mode = str(auto_rbsl_field_mode).lower().replace("-", "_")
+        if field_mode not in ("projected", "direct"):
+            raise ValueError("auto_rbsl_field_mode must be 'projected' or 'direct'")
+        try:
+            B, J, Phi_c, Az, B_c = super().compute_initial_conditions(
+                init_mode=init_mode,
+                max_mfr=max_mfr,
+                auto_rbsl_field_mode=field_mode,
+                auto_rbsl_include_residual_current=bool(auto_rbsl_include_residual_current),
+                **auto_rbsl_kwargs,
+            )
+        except TypeError as exc:
+            if "auto_rbsl_field_mode" not in str(exc):
+                raise
+            B, J, Phi_c, Az, B_c = super().compute_initial_conditions(
+                init_mode=init_mode, max_mfr=max_mfr, **auto_rbsl_kwargs
+            )
+
+        if mode == "auto_rbsl" and field_mode == "direct":
+            return B, J, Phi_c, Az, B_c
+
+        # Project the initial state onto the PT identities so the first
+        # iteration starts from a self-consistent (Phi_c, Az, Bc_z) triple.
+        Az = Az.clone()
+        Az[0] = self.Az_bottom
+        if self.Nz > 1:
+            Az[-1] = 0.0
+        if self._lateral_wall == "BC1":
+            self._enforce_lateral_az_dirichlet_zero(Az)
+        if self.bottom_imprint_robin_weight > 0.0:
+            zeros = torch.zeros_like(Phi_c)
+            Phi_c = self._solve_phi_c_bottom_imprint_robin(zeros)
+            Bc_z = self._lap_xy(Phi_c)
+        else:
+            Bc_z = B_c[2]
+        B, J, B_c = self._reconstruct_state_from_scalars(Phi_c, Az, Bc_z)
+        return B, J, Phi_c, Az, B_c
+
+    # -----------------------------------------------------------------
+    # 2 + 4. Iteration step with stationary bottom row and scalar relaxation
+    # -----------------------------------------------------------------
+    def iteration_step(self, B, J, Phi_c, Az, B_c, mu=1.0, polarity_mask: str = "both"):
+        J_para = self.compute_parallel_currents(J, B)
+
+        # Bottom source row (paper Eq. 43): the stationary state has
+        # J_perp(z=0) = 0, so the full bottom current is field aligned.
+        if polarity_mask == "positive":
+            mask = (self.Bz_obs > 0).to(self.dtype)
+            J_para[0, 0] = J[0, 0] * mask
+            J_para[1, 0] = J[1, 0] * mask
+            J_para[2, 0] = J[2, 0] * mask
+        elif polarity_mask == "negative":
+            mask = (self.Bz_obs < 0).to(self.dtype)
+            J_para[0, 0] = J[0, 0] * mask
+            J_para[1, 0] = J[1, 0] * mask
+            J_para[2, 0] = J[2, 0] * mask
+        elif self._bottom_jperp_zero:
+            J_para[0, 0] = J[0, 0]
+            J_para[1, 0] = J[1, 0]
+            J_para[2, 0] = J[2, 0]
+
+        if self.buffer_window is not None:
+            J_para = J_para * self.buffer_window
+
+        # --- poloidal chain: lap(Bc_z) = d_y J_px - d_x J_py, lap_xy Phi_c = Bc_z
+        source_Bc_z = self._d_dy_centered(J_para[0]) - self._d_dx_centered(J_para[1])
+        zeros_bot = self._zeros_xy()
+        stable_robin = self.bottom_imprint_robin_weight > 0.0
+        if stable_robin:
+            Phi_c_star = self._solve_phi_c_bottom_imprint_robin(source_Bc_z)
+            Bc_z_star = self._lap_xy(Phi_c_star)
+        else:
+            Bc_z_star = self._solve_poisson_3d(
+                source_Bc_z, "neumann", zeros_bot, "neumann"
+            )
+
+            if self._fortran_phi_total_solve and self.B_pot is not None and self.Phi_pot is not None:
+                Bz_total_for_phi = self.B_pot[2] + Bc_z_star
+                Phi_total_star = self._solve_poisson_2d_skip_bottom(
+                    Bz_total_for_phi, "neumann", self.Phi_pot[0]
+                )
+                Phi_c_star = Phi_total_star - self.Phi_pot
+            else:
+                Phi_c_star = self._solve_poisson_2d_skip_bottom(
+                    Bc_z_star, "neumann", zeros_bot
+                )
+
+        if self._lateral_wall == "BC1" and not self._poisson_mudpack_like:
+            self._enforce_lateral_phi_constant_neumann(Phi_c_star)
+            Phi_c_star[0] = zeros_bot
+
+        # --- toroidal chain source S_J
+        if self._rhs_lap_xy == "spectral":
+            lap_xy_Jpz = self._lap_xy_spectral(J_para[2], bc=self._rhs_lap_xy_spectral_ext)
+        else:
+            lap_xy_Jpz = self._lap_xy(J_para[2])
+
+        if self._rhs_jz_div_chain:
+            div_xy_Jp = self._d_dx_centered(J_para[0]) + self._d_dy_centered(J_para[1])
+            source_Jz = lap_xy_Jpz - self._d_dz_centered(div_xy_Jp)
+        else:
+            source_Jz = lap_xy_Jpz - self._d2_dxdz(J_para[0]) - self._d2_dydz(J_para[1])
+
+        if self._toroidal_boundary:
+            Az_star = self._solve_az_from_jz_poisson_source(source_Jz)
+        else:
+            z_top = zeros_bot
+            Jz_star = self._solve_poisson_3d(
+                source_Jz, "dirichlet", self.Jz_obs, "dirichlet", z_top
+            )
+            Az_star = torch.empty_like(Jz_star)
+            Az_star[0] = self.Az_bottom
+            if self.Nz > 1:
+                Jz_for_az = Jz_star[1:].clone()
+                Jz_for_az[-1] = 0.0
+                Jz_for_az[:, :, 0] = 0.0
+                Jz_for_az[:, :, -1] = 0.0
+                Jz_for_az[:, 0, :] = 0.0
+                Jz_for_az[:, -1, :] = 0.0
+                Az_star[1:] = self._solve_poisson_2d(-Jz_for_az, "dirichlet")
+            if self._lateral_wall == "BC1":
+                self._enforce_lateral_az_dirichlet_zero(Az_star)
+
+        # --- under-relaxation on the PT scalars (keeps PT identities exact)
+        if self._relax_scalars and mu < 1.0:
+            Phi_c_new = mu * Phi_c_star + (1.0 - mu) * Phi_c
+            Az_new = mu * Az_star + (1.0 - mu) * Az
+            if stable_robin:
+                Bc_z_new = self._lap_xy(Phi_c_new)
+            else:
+                Bc_z_new = mu * Bc_z_star + (1.0 - mu) * B_c[2]
+        else:
+            Bc_z_new, Phi_c_new, Az_new = Bc_z_star, Phi_c_star, Az_star
+
+        Bc_z_new[0] = zeros_bot
+        Phi_c_new[0] = zeros_bot
+        if stable_robin:
+            Bc_z_new = self._lap_xy(Phi_c_new)
+        Az_new[0] = self.Az_bottom
+        if self.Nz > 1:
+            Az_new[-1] = 0.0
+        if self._lateral_wall == "BC1":
+            self._enforce_lateral_az_dirichlet_zero(Az_new)
+
+        B_new, J_new, B_c_new = self._reconstruct_state_from_scalars(
+            Phi_c_new, Az_new, Bc_z_new
+        )
+
+        if not self._relax_scalars and mu < 1.0:
+            # Legacy field-level relaxation kept only for ablation runs.
+            B_c_new = mu * B_c_new + (1.0 - mu) * B_c
+            J_new = mu * J_new + (1.0 - mu) * J
+            B_new = self.B_pot + B_c_new
+            self._apply_boundary_conditions(B_new, J_new)
+
+        return B_new, J_new, Phi_c_new, Az_new, B_c_new
+
+    # -----------------------------------------------------------------
+    # 4. Safeguarded adaptive iteration driver
+    # -----------------------------------------------------------------
+    def iterate(
+        self,
+        max_iter=200,
+        tol=1e-5,
+        mu=1.0,
+        patience=1,
+        verbose=True,
+        polarity_mask: str = "both",
+        init_mode: InitialConditionMode = "curl_free_current",
+        auto_rbsl_field_mode: str = "direct",
+        auto_rbsl_include_residual_current: bool = True,
+        max_mfr: int = 5,
+        sigma_improvement_tol: Optional[float] = 1e-5,
+        auto_rbsl_improvement_grace: int = 20,
+        mfr_override: Optional[list] = None,
+        axis_n_pts: int = 64,
+        height_frac: float = 1.0,
+        min_sep_px: Optional[int] = None,
+        radius_frac: float = 0.25,
+        chunk_size: Optional[int] = None,
+        work_dtype: Optional[torch.dtype] = None,
+        axis_mode: str = "jhook_pil",
+        use_mirror_path: bool = True,
+        jhook_quantile: float = 0.80,
+        jhook_search_radius_frac: float = 0.35,
+        jhook_search_radius_px: Optional[float] = None,
+        jhook_min_component_px: int = 4,
+        pil_corridor_width_frac: float = 0.40,
+        pil_corridor_width_px: Optional[float] = None,
+        pil_n_ctrl: int = 9,
+        pil_smooth_passes: int = 2,
+        jhook_arc_fit_samples: int = 100,
+        per_step_callback: Optional[Callable[[int, float, torch.Tensor, torch.Tensor], None]] = None,
+        *,
+        adaptive_mu: bool = False,
+        mu_min: float = 0.02,
+        mu_max: float = 1.0,
+        mu_backoff: float = 0.5,
+        mu_growth: float = 1.1,
+        growth_streak: int = 5,
+        divergence_factor: float = 2.0,
+        max_rollbacks: int = 12,
+        stop_mode: str = "sigma_best",
+        fixed_point_update_tol: Optional[float] = None,
+        fixed_point_pde_tol: float = 1.0e-8,
+        fixed_point_observable_tol: Optional[float] = None,
+        fixed_point_patience: int = 10,
+    ):
+        stop_mode = str(stop_mode).lower().replace("-", "_")
+        if stop_mode not in {"sigma_best", "fixed_point"}:
+            raise ValueError("stop_mode must be 'sigma_best' or 'fixed_point'")
+        update_tol = float(tol if fixed_point_update_tol is None else fixed_point_update_tol)
+        pde_tol = float(fixed_point_pde_tol)
+        observable_tol = float(
+            tol if fixed_point_observable_tol is None else fixed_point_observable_tol
+        )
+        fixed_required = int(fixed_point_patience)
+        if update_tol <= 0.0 or pde_tol <= 0.0 or observable_tol <= 0.0:
+            raise ValueError("fixed-point tolerances must be positive")
+        if fixed_required < 1:
+            raise ValueError("fixed_point_patience must be >= 1")
+        mode_norm = str(init_mode).lower().replace("-", "_")
+        is_auto_rbsl_init = mode_norm == "auto_rbsl"
+        auto_grace = max(0, int(auto_rbsl_improvement_grace)) if is_auto_rbsl_init else 0
+
+        B, J, Phi_c, Az, B_c = self.compute_initial_conditions(
+            init_mode=init_mode,
+            auto_rbsl_field_mode=auto_rbsl_field_mode,
+            auto_rbsl_include_residual_current=bool(auto_rbsl_include_residual_current),
+            max_mfr=max_mfr,
+            mfr_override=mfr_override,
+            axis_n_pts=axis_n_pts,
+            height_frac=height_frac,
+            min_sep_px=min_sep_px,
+            radius_frac=radius_frac,
+            chunk_size=chunk_size,
+            work_dtype=work_dtype,
+            axis_mode=axis_mode,
+            use_mirror_path=use_mirror_path,
+            jhook_quantile=jhook_quantile,
+            jhook_search_radius_frac=jhook_search_radius_frac,
+            jhook_search_radius_px=jhook_search_radius_px,
+            jhook_min_component_px=jhook_min_component_px,
+            pil_corridor_width_frac=pil_corridor_width_frac,
+            pil_corridor_width_px=pil_corridor_width_px,
+            pil_n_ctrl=pil_n_ctrl,
+            pil_smooth_passes=pil_smooth_passes,
+            jhook_arc_fit_samples=jhook_arc_fit_samples,
+        )
+
+        sigma0 = self.compute_sigma(B, J)
+        divB0 = self.compute_divB(B)
+        E0 = self.compute_energy(B)
+        if verbose:
+            am = self.alpha_max()
+            am_text = f"{am:.3e}" if am is not None else "off"
+            print(
+                f"Initial  sigma={sigma0:.4e}  divB={divB0:.4e}  E={E0:.4e} "
+                f"(mu0={mu}, adaptive={adaptive_mu}, alpha_max={am_text}, "
+                f"toroidal_bc={self._toroidal_boundary})"
+            )
+
+        history = {
+            "sigma": [],
+            "divB": [],
+            "energy": [],
+            "mu": [],
+            "rollback": [],
+            "sigma_relative_change": [],
+            "energy_relative_change": [],
+            "fixed_point_criteria_met": [],
+        }
+        best_sigma = sigma0
+        best_iter = 0
+        best_state = (B.clone(), J.clone(), Phi_c.clone(), Az.clone(), B_c.clone())
+        stall_count = 0
+        # Match the base driver: require consecutive flat sigma improvements
+        # before sigma_improvement_tol can terminate the search.
+        improvement_flat_count = 0
+        improvement_flat_required = max(int(patience), 1)
+        improve_streak = 0
+        rollbacks = 0
+        mu_cur = float(mu)
+        prev_sigma = sigma0
+        use_sigma_improvement_stop = (
+            sigma_improvement_tol is not None and float(sigma_improvement_tol) > 0.0
+        )
+        sigma_improvement_eps = (
+            float(sigma_improvement_tol) if use_sigma_improvement_stop else 0.0
+        )
+        last_sigma_improvement = None
+        stop_reason = "max_iter"
+        fixed_point_streak = 0
+        fixed_point_converged = False
+        final_iter = 0
+
+        for n in range(1, max_iter + 1):
+            B_n, J_n, Phi_c_n, Az_n, B_c_n = self.iteration_step(
+                B, J, Phi_c, Az, B_c, mu=mu_cur, polarity_mask=polarity_mask
+            )
+            sigma = self.compute_sigma(B_n, J_n)
+
+            diverged = (not math.isfinite(sigma)) or (
+                sigma > divergence_factor * max(best_sigma, 1e-30)
+            )
+            if adaptive_mu and diverged:
+                rollbacks += 1
+                mu_cur = max(mu_cur * mu_backoff, mu_min)
+                B, J, Phi_c, Az, B_c = (s.clone() for s in best_state)
+                improve_streak = 0
+                history["sigma"].append(sigma)
+                history["divB"].append(float("nan"))
+                history["energy"].append(float("nan"))
+                history["mu"].append(mu_cur)
+                history["rollback"].append(1)
+                history["sigma_relative_change"].append(float("nan"))
+                history["energy_relative_change"].append(float("nan"))
+                history["fixed_point_criteria_met"].append(0)
+                fixed_point_streak = 0
+                if verbose:
+                    print(
+                        f"Iter {n:4d} | sigma={sigma:.4e} DIVERGED -> rollback to "
+                        f"iter {best_iter} (best sigma={best_sigma:.4e}), mu={mu_cur:.3f}"
+                )
+                if rollbacks >= max_rollbacks:
+                    stop_reason = "max_rollbacks"
+                    if verbose:
+                        print(f"Stopping after {rollbacks} rollbacks.")
+                    break
+                continue
+
+            B, J, Phi_c, Az, B_c = B_n, J_n, Phi_c_n, Az_n, B_c_n
+            divB = self.compute_divB(B)
+            energy = self.compute_energy(B)
+            sigma_relative_change = abs(sigma - prev_sigma) / max(
+                abs(prev_sigma), 1.0e-30
+            )
+            previous_energy = history["energy"][-1] if history["energy"] else E0
+            energy_relative_change = abs(energy - previous_energy) / max(
+                abs(previous_energy), 1.0e-30
+            )
+
+            history["sigma"].append(sigma)
+            history["divB"].append(divB)
+            history["energy"].append(energy)
+            history["mu"].append(mu_cur)
+            history["rollback"].append(0)
+            history["sigma_relative_change"].append(sigma_relative_change)
+            history["energy_relative_change"].append(energy_relative_change)
+
+            diagnostics = getattr(self, "_last_iteration_diagnostics", {}) or {}
+            map_residual = max(
+                float(diagnostics.get("phi_map_residual_relative", float("inf"))),
+                float(diagnostics.get("az_map_residual_relative", float("inf"))),
+                float(diagnostics.get("h_k0_map_residual_relative", 0.0)),
+            )
+            pde_residual = max(
+                float(diagnostics.get("poloidal_pde_residual_relative", float("inf"))),
+                float(diagnostics.get("toroidal_pde_residual_relative", float("inf"))),
+                float(diagnostics.get("mixed_row_residual_relative", 0.0)),
+            )
+            fixed_met = (
+                stop_mode == "fixed_point"
+                and math.isfinite(map_residual)
+                and math.isfinite(pde_residual)
+                and map_residual <= update_tol
+                and pde_residual <= pde_tol
+                and sigma_relative_change <= observable_tol
+                and energy_relative_change <= observable_tol
+            )
+            history["fixed_point_criteria_met"].append(int(fixed_met))
+            fixed_point_streak = fixed_point_streak + 1 if fixed_met else 0
+            final_iter = n
+
+            if per_step_callback is not None:
+                per_step_callback(n, sigma, B, J)
+
+            sigma_improvement = prev_sigma - sigma
+            last_sigma_improvement = sigma_improvement
+            prev_sigma = sigma
+            if sigma_improvement < sigma_improvement_eps:
+                improvement_flat_count += 1
+            else:
+                improvement_flat_count = 0
+
+            if sigma < best_sigma:
+                best_sigma = sigma
+                best_iter = n
+                best_state = (B.clone(), J.clone(), Phi_c.clone(), Az.clone(), B_c.clone())
+                stall_count = 0
+                improve_streak += 1
+                if adaptive_mu and improve_streak >= growth_streak:
+                    mu_cur = min(mu_cur * mu_growth, mu_max)
+                    improve_streak = 0
+            else:
+                stall_count += 1
+                improve_streak = 0
+
+            if verbose and (n == 1 or n % 10 == 0):
+                print(
+                    f"Iter {n:4d} | sigma={sigma:.4e} | divB={divB:.4e} | "
+                    f"E={energy:.4e} | mu={mu_cur:.3f}"
+                )
+
+            if stop_mode == "fixed_point" and fixed_point_streak >= fixed_required:
+                stop_reason = "fixed_point"
+                fixed_point_converged = True
+                if verbose:
+                    print(
+                        f"Fixed point attained at iteration {n}: "
+                        f"map={map_residual:.4e}, pde={pde_residual:.4e}, "
+                        f"observable drift<={observable_tol:.4e} for "
+                        f"{fixed_point_streak} accepted steps"
+                    )
+                break
+
+            if stop_mode == "sigma_best" and sigma < tol:
+                stop_reason = "tol"
+                if verbose:
+                    print(f"Converged at iteration {n}")
+                break
+
+            improvement_stop_allowed = n > auto_grace
+
+            if (
+                stop_mode == "sigma_best"
+                and improvement_stop_allowed
+                and use_sigma_improvement_stop
+                and improvement_flat_count >= improvement_flat_required
+            ):
+                stop_reason = "sigma_improvement_tol"
+                if verbose:
+                    print(
+                        f"Early stop at iter {n}: sigma improvement flat for "
+                        f"{improvement_flat_count} steps "
+                        f"(last {sigma_improvement:.4e} < {sigma_improvement_eps:.4e}; "
+                        f"best sigma={best_sigma:.4e} at iter {best_iter})"
+                )
+                break
+
+            if (
+                stop_mode == "sigma_best"
+                and improvement_stop_allowed
+                and patience > 0
+                and stall_count >= patience
+            ):
+                stop_reason = "sigma_stall"
+                if verbose:
+                    print(
+                        f"Early stop at iter {n}: sigma not improving "
+                        f"(best sigma={best_sigma:.4e} at iter {best_iter})"
+                    )
+                break
+
+        final_state = (B, J, Phi_c, Az, B_c)
+        selected_state = final_state if stop_mode == "fixed_point" else best_state
+        self._B, self._J = selected_state[0], selected_state[1]
+        self._Phi_c, self._Az = selected_state[2], selected_state[3]
+        final_vs_best = torch.sqrt(
+            torch.mean((final_state[0].double() - best_state[0].double()) ** 2)
+        ) / torch.clamp(
+            torch.sqrt(torch.mean(best_state[0].double() ** 2)), min=1.0e-30
+        )
+        history["best_sigma"] = best_sigma
+        history["best_iter"] = best_iter
+        history["rollbacks"] = rollbacks
+        history["stop_reason"] = stop_reason
+        history["stop_mode"] = stop_mode
+        history["selected_state"] = (
+            "final_accepted_iterate" if stop_mode == "fixed_point" else "best_sigma"
+        )
+        history["final_iter"] = final_iter
+        history["final_sigma"] = float(self.compute_sigma(final_state[0], final_state[1]))
+        history["final_vs_best_B_relative"] = float(final_vs_best.item())
+        history["fixed_point_converged"] = fixed_point_converged
+        history["fixed_point_streak"] = fixed_point_streak
+        history["fixed_point_tolerances"] = {
+            "update": update_tol,
+            "pde": pde_tol,
+            "observable": observable_tol,
+            "patience": fixed_required,
+        }
+        history["sigma_improvement_tol"] = (
+            sigma_improvement_eps if use_sigma_improvement_stop else None
+        )
+        history["auto_rbsl_improvement_grace"] = auto_grace
+        history["last_sigma_improvement"] = last_sigma_improvement
+        history["init_diagnostics"] = self._init_diagnostics
+        return history
+
+
+# =====================================================================
+# MBSL Sect. 3 boundary-consistency diagnostic (planar limit)
+# =====================================================================
+def _corr2(a: torch.Tensor, b: torch.Tensor) -> float:
+    num = float((a * b).sum().item())
+    den = float(torch.sqrt((a * a).sum() * (b * b).sum()).item()) + 1e-30
+    return num / den
+
+
+def compute_mbsl_boundary_metrics(solver: NFPTSolverGPU, B: torch.Tensor) -> dict:
+    """
+    Decompose the bottom tangential field per MBSL Sect. 3 (planar limit) and
+    compare the solution against observations.
+
+    The non-potential tangential field ``B_t_tilde = B_t - B_pot,t`` is split
+    into a toroidal part (scalar T, from its surface curl, MBSL Eq. 35) and a
+    poloidal part (scalar S_tilde, from its surface divergence, MBSL Eq. 37).
+    Since the solver imposes only ``B_z`` and ``J_z`` at z = 0, these
+    correlations measure how well the reconstruction reproduces the unimposed
+    tangential boundary information.
+    """
+    if solver.Bx_obs is None or solver.By_obs is None or solver.B_pot is None:
+        return {}
+
+    Bpx = solver.B_pot[0, 0]
+    Bpy = solver.B_pot[1, 0]
+
+    def decompose(bx: torch.Tensor, by: torch.Tensor):
+        btx = bx - Bpx
+        bty = by - Bpy
+        curl_z = solver._d_dx_2d(bty) - solver._d_dy_2d(btx)
+        div_t = solver._d_dx_2d(btx) + solver._d_dy_2d(bty)
+        T = solver._solve_poisson_2d((-curl_z).unsqueeze(0), "dirichlet").squeeze(0)
+        S = solver._solve_poisson_2d(div_t.unsqueeze(0), "neumann").squeeze(0)
+        return btx, bty, T, S
+
+    btx_o, bty_o, T_o, S_o = decompose(solver.Bx_obs, solver.By_obs)
+    btx_s, bty_s, T_s, S_s = decompose(B[0, 0], B[1, 0])
+
+    bt_obs = torch.stack([btx_o, bty_o])
+    bt_sol = torch.stack([btx_s, bty_s])
+    return {
+        "bt_tilde_cvec": _corr2(bt_sol, bt_obs),
+        "toroidal_T_corr": _corr2(T_s, T_o),
+        "poloidal_S_corr": _corr2(S_s, S_o),
+        "bt_tilde_rms_obs": float(torch.sqrt((bt_obs**2).mean()).item()),
+        "bt_tilde_rms_sol": float(torch.sqrt((bt_sol**2).mean()).item()),
+    }
+
+# =============================================================================
+# GAUSSIAN-SEPARATED NFGS SOLVER
+# =============================================================================
+class NFGSSolverGPU(StableNFPTSolverGPU):
+    """Stable NFPT with Gaussian-separated background attribution.
+
+    The horizontal separation uses the same endpoint-Neumann eigenvalues as
+    the MUDPACK-like 2-D Poisson solve.  By default the observed divergence and
+    ``B^>`` horizontal reconstruction use DCT-consistent spectral div/grad
+    operators (``gaussian_horizontal_operator='spectral'``); set ``'fd'`` for
+    the legacy finite-difference path.  The unseparable vertical open flux and
+    external/harmonic horizontal field are explicit background components;
+    they are never silently inferred from one finite-patch zero mode.  The
+    current-carrying normal field uses a transparent top Robin boundary in the
+    same modal basis.  The default physical horizontal zero-mode closure is the
+    current-free ``frozen_linear_harmonic`` lift; height-coupled alternatives
+    must be selected explicitly for sensitivity experiments.
+    """
+
+    def __init__(self, *args, **kwargs):
+        # Retain the caller's Stable-NFPT profile for init_mode="cfcf".
+        self._stable_cfcf_ctor_args = args
+        self._stable_cfcf_ctor_kwargs = dict(kwargs)
+        source_partition_mode = str(
+            kwargs.pop("source_partition_mode", "gaussian_separated")
+        ).lower().replace("-", "_")
+        weak_field_floor_b2 = float(kwargs.pop("weak_field_floor_b2", 1.0e-20))
+        alpha_clip_scale = kwargs.pop("alpha_clip_scale", None)
+        if alpha_clip_scale is not None:
+            alpha_clip_scale = float(alpha_clip_scale)
+            if "alpha_limit_factor" in kwargs and float(
+                kwargs["alpha_limit_factor"]
+            ) != alpha_clip_scale:
+                raise ValueError(
+                    "alpha_clip_scale and alpha_limit_factor specify different values"
+                )
+            kwargs["alpha_limit_factor"] = alpha_clip_scale
+        mean_bz_policy = str(kwargs.pop("mean_bz_policy", "uniform_open")).lower()
+        horizontal_zero_mode_policy = str(
+            kwargs.pop("horizontal_zero_mode_policy", "frozen_linear_harmonic")
+        ).lower()
+        d0_zero_mode_policy = str(
+            kwargs.pop("d0_zero_mode_policy", "error")
+        ).lower()
+        harmonic_residual_policy = str(
+            kwargs.pop("harmonic_residual_policy", "diagnose")
+        ).lower()
+        source_zero_mode_policy = str(
+            kwargs.pop("source_zero_mode_policy", "error")
+        ).lower()
+        handoff_projection_policy = str(
+            kwargs.pop("handoff_projection_policy", "project")
+        ).lower()
+        mean_mode_tolerance = float(kwargs.pop("mean_mode_tolerance", 1.0e-6))
+        source_zero_mode_tolerance = float(
+            kwargs.pop("source_zero_mode_tolerance", 1.0e-2)
+        )
+        k0_ode_smoothness = float(kwargs.pop("k0_ode_smoothness", 1.0e-3))
+        coupled_k0_discretization = str(
+            kwargs.pop(
+                "coupled_k0_discretization",
+                "staggered_face_D1_true_three_point_curvature",
+            )
+        ).lower().replace("-", "_")
+        k0_update_mu = kwargs.pop("k0_update_mu", None)
+        k0_spline_basis_size = int(kwargs.pop("k0_spline_basis_size", 8))
+        k0_current_target_placement = kwargs.pop("k0_current_target_placement", None)
+        bottom_parallel_current_mode = str(
+            kwargs.pop("bottom_parallel_current_mode", "observed_full")
+        ).lower().replace("-", "_")
+        handoff_projection_tolerance = float(
+            kwargs.pop("handoff_projection_tolerance", 1.0e-6)
+        )
+        bottom_divergence_projection_weight = float(
+            kwargs.pop("bottom_divergence_projection_weight", 0.0)
+        )
+        bottom_divergence_robin_weight = float(
+            kwargs.pop("bottom_divergence_robin_weight", 0.0)
+        )
+        poloidal_update_mode = str(
+            kwargs.pop("poloidal_update_mode", "direct")
+        ).lower().replace("-", "_")
+        record_iteration_diagnostics = bool(
+            kwargs.pop("record_iteration_diagnostics", False)
+        )
+        soft_cfcf_epsilon = kwargs.pop("soft_cfcf_epsilon", None)
+        soft_cfcf_mode_batch_size = int(
+            kwargs.pop("soft_cfcf_mode_batch_size", 1024)
+        )
+        soft_cfcf_normal_ridge = float(
+            kwargs.pop("soft_cfcf_normal_ridge", 0.0)
+        )
+        user_supplied_open_bz = kwargs.pop("user_supplied_open_bz", None)
+        user_supplied_horizontal_field = kwargs.pop(
+            "user_supplied_horizontal_field", None
+        )
+        external_potential_field = kwargs.pop("external_potential_field", None)
+        for key in (
+            "mean_bz_policy",
+            "horizontal_zero_mode_policy",
+            "d0_zero_mode_policy",
+            "harmonic_residual_policy",
+            "source_zero_mode_policy",
+            "handoff_projection_policy",
+            "mean_mode_tolerance",
+            "source_zero_mode_tolerance",
+            "k0_ode_smoothness",
+            "coupled_k0_discretization",
+            "k0_update_mu",
+            "k0_spline_basis_size",
+            "k0_current_target_placement",
+            "bottom_parallel_current_mode",
+            "handoff_projection_tolerance",
+            "bottom_divergence_projection_weight",
+            "bottom_divergence_robin_weight",
+            "poloidal_update_mode",
+            "record_iteration_diagnostics",
+            "soft_cfcf_epsilon",
+            "soft_cfcf_mode_batch_size",
+            "soft_cfcf_normal_ridge",
+            "user_supplied_open_bz",
+            "user_supplied_horizontal_field",
+            "external_potential_field",
+            "source_partition_mode",
+            "weak_field_floor_b2",
+            "alpha_clip_scale",
+            "gaussian_horizontal_operator",
+            "vertical_current_operator",
+        ):
+            self._stable_cfcf_ctor_kwargs.pop(key, None)
+        poisson_z_order = int(kwargs.pop("poisson_z_order", 2))
+        poisson_z_backend = str(kwargs.pop("poisson_z_backend", "thomas")).lower()
+        ccu_pure_current = bool(kwargs.pop("ccu_pure_current", True))
+        t_source = str(kwargs.pop("t_source", "jz")).lower()
+        toroidal_boundary = bool(kwargs.pop("toroidal_boundary", True))
+        poisson_mudpack_like = bool(kwargs.pop("poisson_mudpack_like", True))
+        poisson_xy_order = int(kwargs.pop("poisson_xy_order", 2))
+        fortran_bjt00 = bool(kwargs.pop("fortran_bjt00", False))
+        fortran_phi_total_solve = bool(kwargs.pop("fortran_phi_total_solve", False))
+        gaussian_horizontal_operator = str(
+            kwargs.pop("gaussian_horizontal_operator", "spectral")
+        ).lower()
+        vertical_current_operator = str(
+            kwargs.pop("vertical_current_operator", "staggered_face")
+        ).lower().replace("-", "_")
+
+        if poisson_z_order != 2:
+            raise ValueError(
+                "NFGS v1 supports only poisson_z_order=2 for the top Robin solve"
+            )
+        if poisson_z_backend != "thomas":
+            raise ValueError("NFGS v1 supports only poisson_z_backend='thomas'")
+        if poisson_xy_order != 2:
+            raise ValueError("NFGS v1 supports only poisson_xy_order=2")
+        if not poisson_mudpack_like:
+            raise ValueError(
+                "NFGS requires poisson_mudpack_like=True so separation and "
+                "2-D Poisson use the same endpoint-Neumann spectrum"
+            )
+        if not ccu_pure_current:
+            raise ValueError("NFGS requires ccu_pure_current=True")
+        if t_source != "jz":
+            raise ValueError("NFGS v1 supports only t_source='jz'")
+        if not toroidal_boundary:
+            raise ValueError("NFGS v1 requires toroidal_boundary=True")
+        if fortran_bjt00:
+            raise ValueError(
+                "NFGS requires fortran_bjt00=False to preserve explicit mean modes"
+            )
+        if fortran_phi_total_solve:
+            raise ValueError("NFGS requires fortran_phi_total_solve=False")
+
+        valid_mean_bz = {
+            "uniform_open", "require_balanced", "external_potential", "user_supplied"
+        }
+        valid_horizontal = {
+            "omit",
+            "frozen_linear_harmonic",
+            "constrained_spline_harmonic",
+            "coupled_k0",
+            "external_potential",
+            "user_supplied",
+        }
+        valid_projection = {"error", "warn_project", "project"}
+        if source_partition_mode not in {"gaussian_separated", "legacy_single_field"}:
+            raise ValueError(
+                "source_partition_mode must be 'gaussian_separated' or "
+                "'legacy_single_field'"
+            )
+        if weak_field_floor_b2 <= 0.0 or not math.isfinite(weak_field_floor_b2):
+            raise ValueError("weak_field_floor_b2 must be finite and positive")
+        if mean_bz_policy not in valid_mean_bz:
+            raise ValueError(f"mean_bz_policy must be one of {sorted(valid_mean_bz)}")
+        if horizontal_zero_mode_policy not in valid_horizontal:
+            raise ValueError(
+                "horizontal_zero_mode_policy must be one of "
+                f"{sorted(valid_horizontal)}"
+            )
+        if d0_zero_mode_policy not in valid_projection:
+            raise ValueError(
+                f"d0_zero_mode_policy must be one of {sorted(valid_projection)}"
+            )
+        if source_zero_mode_policy not in valid_projection:
+            raise ValueError(
+                f"source_zero_mode_policy must be one of {sorted(valid_projection)}"
+            )
+        if harmonic_residual_policy not in {"diagnose", "warn", "error"}:
+            raise ValueError(
+                "harmonic_residual_policy must be 'diagnose', 'warn', or 'error'"
+            )
+        if handoff_projection_policy not in {"project", "error"}:
+            raise ValueError("handoff_projection_policy must be 'project' or 'error'")
+        if mean_mode_tolerance <= 0.0 or source_zero_mode_tolerance <= 0.0:
+            raise ValueError("zero-mode tolerances must be positive")
+        if k0_ode_smoothness < 0.0:
+            raise ValueError("k0_ode_smoothness must be non-negative")
+        valid_k0_discretization = {
+            "staggered_face_d1_true_three_point_curvature",
+            "legacy_plane_centred",
+        }
+        if coupled_k0_discretization not in valid_k0_discretization:
+            raise ValueError(
+                "coupled_k0_discretization must be one of "
+                f"{sorted(valid_k0_discretization)}"
+            )
+        # Preserve the publication label spelling for the corrected operator.
+        if (
+            coupled_k0_discretization
+            == "staggered_face_d1_true_three_point_curvature"
+        ):
+            coupled_k0_discretization = (
+                "staggered_face_D1_true_three_point_curvature"
+            )
+        if k0_update_mu is not None:
+            k0_update_mu = float(k0_update_mu)
+            if not 0.0 < k0_update_mu <= 1.0:
+                raise ValueError("k0_update_mu must be in (0, 1]")
+        elif horizontal_zero_mode_policy == "constrained_spline_harmonic":
+            # The mean-current channel is a global nonlinear feedback.  Give
+            # the constrained closure a dedicated conservative default even
+            # when the PT scalars use the ordinary full update.
+            k0_update_mu = 0.2
+        if k0_spline_basis_size < 4:
+            raise ValueError("k0_spline_basis_size must be >= 4")
+        if k0_current_target_placement is None:
+            # Keep the historical cell-centred mean target as the production
+            # default.  Face placement remains available for diagnose ablations
+            # because nonlinear TD3 evidence showed face-default can degrade
+            # C_vec even while sigma continues to fall.
+            k0_current_target_placement = "cell"
+        else:
+            k0_current_target_placement = str(
+                k0_current_target_placement
+            ).lower().replace("-", "_")
+        if k0_current_target_placement not in {"face", "cell"}:
+            raise ValueError(
+                "k0_current_target_placement must be 'face' or 'cell'"
+            )
+        if (
+            k0_current_target_placement == "face"
+            and vertical_current_operator != "staggered_face"
+        ):
+            raise ValueError(
+                "k0_current_target_placement='face' requires "
+                "vertical_current_operator='staggered_face'"
+            )
+        valid_bottom_parallel = {"observed_full", "face_parallel_exact_jz"}
+        if bottom_parallel_current_mode not in valid_bottom_parallel:
+            raise ValueError(
+                "bottom_parallel_current_mode must be one of "
+                f"{sorted(valid_bottom_parallel)}"
+            )
+        if (
+            bottom_parallel_current_mode == "face_parallel_exact_jz"
+            and vertical_current_operator != "staggered_face"
+        ):
+            raise ValueError(
+                "bottom_parallel_current_mode='face_parallel_exact_jz' requires "
+                "vertical_current_operator='staggered_face'"
+            )
+        if handoff_projection_tolerance <= 0.0:
+            raise ValueError("handoff_projection_tolerance must be positive")
+        if not 0.0 <= bottom_divergence_projection_weight <= 1.0:
+            raise ValueError(
+                "bottom_divergence_projection_weight must be between 0 and 1"
+            )
+        if not 0.0 <= bottom_divergence_robin_weight <= 1.0:
+            raise ValueError(
+                "bottom_divergence_robin_weight must be between 0 and 1"
+            )
+        if (
+            bottom_divergence_projection_weight > 0.0
+            and bottom_divergence_robin_weight > 0.0
+        ):
+            raise ValueError(
+                "Bottom-divergence projection and mixed Robin controls are "
+                "mutually exclusive"
+            )
+        if source_partition_mode == "legacy_single_field":
+            if bottom_divergence_projection_weight != 0.0 or bottom_divergence_robin_weight != 0.0:
+                raise ValueError(
+                    "legacy_single_field is a no-separation compatibility branch and "
+                    "requires both bottom-divergence controls to be zero"
+                )
+            if horizontal_zero_mode_policy != "omit":
+                raise ValueError(
+                    "legacy_single_field requires horizontal_zero_mode_policy='omit'"
+                )
+        if poloidal_update_mode not in {"direct", "two_stage"}:
+            raise ValueError(
+                "poloidal_update_mode must be 'direct' or 'two_stage'"
+            )
+        if soft_cfcf_epsilon is not None and float(soft_cfcf_epsilon) < 0.0:
+            raise ValueError("soft_cfcf_epsilon must be non-negative")
+        if soft_cfcf_mode_batch_size <= 0:
+            raise ValueError("soft_cfcf_mode_batch_size must be positive")
+        if soft_cfcf_normal_ridge < 0.0:
+            raise ValueError("soft_cfcf_normal_ridge must be non-negative")
+        valid_gaussian_horizontal = {"fd", "spectral"}
+        if gaussian_horizontal_operator not in valid_gaussian_horizontal:
+            raise ValueError(
+                "gaussian_horizontal_operator must be one of "
+                f"{sorted(valid_gaussian_horizontal)}"
+            )
+        valid_vertical_current = {"staggered_face", "collocated_centered"}
+        if vertical_current_operator not in valid_vertical_current:
+            raise ValueError(
+                "vertical_current_operator must be one of "
+                f"{sorted(valid_vertical_current)}"
+            )
+
+        super().__init__(
+            *args,
+            poisson_z_order=2,
+            poisson_z_backend="thomas",
+            poisson_xy_order=2,
+            poisson_mudpack_like=True,
+            ccu_pure_current=True,
+            t_source="jz",
+            toroidal_boundary=True,
+            fortran_bjt00=False,
+            fortran_phi_total_solve=False,
+            **kwargs,
+        )
+        if self.Nz < 3:
+            raise ValueError("NFGS requires Nz >= 3")
+        if (
+            horizontal_zero_mode_policy
+            in {"coupled_k0", "constrained_spline_harmonic"}
+            and not self._relax_scalars
+        ):
+            raise ValueError("coupled horizontal harmonic modes require relax_scalars=True")
+        if (
+            horizontal_zero_mode_policy == "constrained_spline_harmonic"
+            and vertical_current_operator != "staggered_face"
+        ):
+            raise ValueError(
+                "constrained_spline_harmonic requires "
+                "vertical_current_operator='staggered_face'"
+            )
+        if (
+            horizontal_zero_mode_policy == "constrained_spline_harmonic"
+            and k0_spline_basis_size > self.Nz
+        ):
+            raise ValueError("k0_spline_basis_size must not exceed Nz")
+
+        self.source_partition_mode = source_partition_mode
+        self.weak_field_floor_b2 = weak_field_floor_b2
+        self.alpha_clip_scale = self._alpha_limit_factor
+        self.mean_bz_policy = mean_bz_policy
+        self.horizontal_zero_mode_policy = horizontal_zero_mode_policy
+        self.d0_zero_mode_policy = d0_zero_mode_policy
+        self.harmonic_residual_policy = harmonic_residual_policy
+        self.source_zero_mode_policy = source_zero_mode_policy
+        self.handoff_projection_policy = handoff_projection_policy
+        self.mean_mode_tolerance = mean_mode_tolerance
+        self.source_zero_mode_tolerance = source_zero_mode_tolerance
+        self.k0_ode_smoothness = k0_ode_smoothness
+        self.coupled_k0_discretization = coupled_k0_discretization
+        self.k0_update_mu = k0_update_mu
+        self.k0_spline_basis_size = k0_spline_basis_size
+        self.k0_current_target_placement = k0_current_target_placement
+        self.bottom_parallel_current_mode = bottom_parallel_current_mode
+        self.handoff_projection_tolerance = handoff_projection_tolerance
+        self.bottom_divergence_projection_weight = (
+            bottom_divergence_projection_weight
+        )
+        self.bottom_divergence_robin_weight = bottom_divergence_robin_weight
+        self.poloidal_update_mode = poloidal_update_mode
+        self.record_iteration_diagnostics = record_iteration_diagnostics
+        self.gaussian_horizontal_operator = gaussian_horizontal_operator
+        self.vertical_current_operator = vertical_current_operator
+        grid_scale = min(float(self.dx), float(self.dy), float(self.dz))
+        self.soft_cfcf_epsilon = (
+            1.0e-4 / (grid_scale * grid_scale)
+            if soft_cfcf_epsilon is None
+            else float(soft_cfcf_epsilon)
+        )
+        self.soft_cfcf_mode_batch_size = soft_cfcf_mode_batch_size
+        self.soft_cfcf_normal_ridge = soft_cfcf_normal_ridge
+        self._user_supplied_open_bz = user_supplied_open_bz
+        self._user_supplied_horizontal_field = user_supplied_horizontal_field
+        self._external_potential_field_input = external_potential_field
+        self._last_staggered_face_diagnostics: dict[str, float | str] = {}
+        self._last_iteration_diagnostics: dict[str, float] = {}
+
+        self.B_mean: Optional[torch.Tensor] = None
+        self.Bz_open_mean: Optional[torch.Tensor] = None
+        self.Bh_mean_bottom: Optional[torch.Tensor] = None
+        self.B_below: Optional[torch.Tensor] = None
+        self.B_open: Optional[torch.Tensor] = None
+        self.B_external_harmonic: Optional[torch.Tensor] = None
+        self.D0: Optional[torch.Tensor] = None
+        self.Bz_below: Optional[torch.Tensor] = None
+        self.Bz_above: Optional[torch.Tensor] = None
+        self.Phi_below_bottom: Optional[torch.Tensor] = None
+        self.Phi_above_bottom: Optional[torch.Tensor] = None
+        self.B_background: Optional[torch.Tensor] = None
+        self.gaussian_separation_diagnostics: Optional[dict] = None
+        self._nfgs_k: Optional[torch.Tensor] = None
+        self._last_Bc_z: Optional[torch.Tensor] = None
+        self._stable_cfcf_boundary: Optional[dict] = None
+        self._phi_below_hat: Optional[torch.Tensor] = None
+        self._phi_above_hat: Optional[torch.Tensor] = None
+        self._source_zero_mode_history: list[float] = []
+        self._last_source_zero_mode_by_height: list[float] = []
+        self._H_k0: Optional[torch.Tensor] = None
+        self._H_k0_bottom_target: Optional[torch.Tensor] = None
+        self._k0_face_derivative_matrix: Optional[torch.Tensor] = None
+        self._k0_curvature_matrix: Optional[torch.Tensor] = None
+        self._k0_centered_derivative_matrix: Optional[torch.Tensor] = None
+        self._k0_ode_operator: Optional[torch.Tensor] = None
+        self._k0_ode_cholesky: Optional[torch.Tensor] = None
+        self._k0_spline_basis: Optional[torch.Tensor] = None
+        self._k0_spline_design: Optional[torch.Tensor] = None
+        self._k0_spline_kkt: Optional[torch.Tensor] = None
+        self._k0_spline_constraints: Optional[torch.Tensor] = None
+        self._k0_diagnostics: dict = {}
+        self._k0_ode_residual_history: list[float] = []
+        self._bottom_dphi_c_target: Optional[torch.Tensor] = None
+        self._bottom_divergence_projection_history: list[dict[str, float]] = []
+        self._iteration_diagnostics_history: list[dict[str, float]] = []
+        self._endpoint_neumann_alpha_x_cache: Optional[torch.Tensor] = None
+        self._endpoint_neumann_alpha_y_cache: Optional[torch.Tensor] = None
+
+    # ------------------------------------------------------------------
+    # Modal helpers and Gaussian separation
+    # ------------------------------------------------------------------
+    def _dct2(self, value: torch.Tensor) -> torch.Tensor:
+        return self._dct1(self._dct1(value, -1), -2)
+
+    def _endpoint_neumann_alpha_x(self) -> torch.Tensor:
+        """Discrete |∂x| factors with α² = -λ_x for endpoint-Neumann DCT."""
+        cached = self._endpoint_neumann_alpha_x_cache
+        if cached is not None:
+            return cached
+        kx = torch.arange(self.Nx, device=self.device, dtype=self.dtype)
+        cached = (
+            2.0
+            * torch.sin(torch.pi * kx / (2.0 * max(self.Nx - 1, 1)))
+            / float(self.dx)
+        )
+        self._endpoint_neumann_alpha_x_cache = cached
+        return cached
+
+    def _endpoint_neumann_alpha_y(self) -> torch.Tensor:
+        """Discrete |∂y| factors with α² = -λ_y for endpoint-Neumann DCT."""
+        cached = self._endpoint_neumann_alpha_y_cache
+        if cached is not None:
+            return cached
+        ky = torch.arange(self.Ny, device=self.device, dtype=self.dtype)
+        cached = (
+            2.0
+            * torch.sin(torch.pi * ky / (2.0 * max(self.Ny - 1, 1)))
+            / float(self.dy)
+        )
+        self._endpoint_neumann_alpha_y_cache = cached
+        return cached
+
+    def _spectral_dx_2d(self, value: torch.Tensor) -> torch.Tensor:
+        """α-consistent ∂/∂x for Neumann DCT fields (DST_x × DCT_y)."""
+        hat = self._dct2(value)
+        sine_hat = -self._endpoint_neumann_alpha_x() * hat
+        tmp = self._idct1(sine_hat, -2)
+        out = torch.zeros_like(value)
+        if value.size(-1) >= 3:
+            out[..., 1:-1] = self._idst1(tmp[..., 1:-1], -1)
+        return out
+
+    def _spectral_dy_2d(self, value: torch.Tensor) -> torch.Tensor:
+        """α-consistent ∂/∂y for Neumann DCT fields (DCT_x × DST_y)."""
+        hat = self._dct2(value)
+        sine_hat = -self._endpoint_neumann_alpha_y()[:, None] * hat
+        tmp = self._idct1(sine_hat, -1)
+        out = torch.zeros_like(value)
+        if value.size(-2) >= 3:
+            out[..., 1:-1, :] = self._idst1(tmp[..., 1:-1, :], -2)
+        return out
+
+    def _spectral_grad_xy(self, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._spectral_dx_2d(value), self._spectral_dy_2d(value)
+
+    def _dstx_dcty_hat(self, bx: torch.Tensor) -> torch.Tensor:
+        """Sine-cosine coefficients of Bx aligned with DCT mode indices."""
+        out = torch.zeros_like(bx)
+        if bx.size(-1) < 3:
+            return out
+        tmp = self._dct1(bx, -2)
+        out[..., 1:-1] = self._dst1(tmp[..., 1:-1], -1)
+        return out
+
+    def _dctx_dsty_hat(self, by: torch.Tensor) -> torch.Tensor:
+        """Cosine-sine coefficients of By aligned with DCT mode indices."""
+        out = torch.zeros_like(by)
+        if by.size(-2) < 3:
+            return out
+        tmp = self._dct1(by, -1)
+        out[..., 1:-1, :] = self._dst1(tmp[..., 1:-1, :], -2)
+        return out
+
+    def _spectral_div_xy(
+        self, bx: torch.Tensor, by: torch.Tensor
+    ) -> torch.Tensor:
+        """Neumann-DCT divergence adjoint to ``-_spectral_grad_xy``."""
+        d_hat = (
+            self._endpoint_neumann_alpha_x() * self._dstx_dcty_hat(bx)
+            + self._endpoint_neumann_alpha_y()[:, None] * self._dctx_dsty_hat(by)
+        )
+        return self._idct2(d_hat)
+
+    def _spectral_div_xy_hat(
+        self, bx: torch.Tensor, by: torch.Tensor
+    ) -> torch.Tensor:
+        """Modal coefficients of ``_spectral_div_xy`` (no inverse DCT)."""
+        return (
+            self._endpoint_neumann_alpha_x() * self._dstx_dcty_hat(bx)
+            + self._endpoint_neumann_alpha_y()[:, None] * self._dctx_dsty_hat(by)
+        )
+
+    def _horizontal_grad_xy(
+        self, value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.gaussian_horizontal_operator == "spectral":
+            return self._spectral_grad_xy(value)
+        return self._d_dx_2d(value), self._d_dy_2d(value)
+
+    def _horizontal_div_xy(
+        self, bx: torch.Tensor, by: torch.Tensor
+    ) -> torch.Tensor:
+        if self.gaussian_horizontal_operator == "spectral":
+            return self._spectral_div_xy(bx, by)
+        return self._d_dx_2d(bx) + self._d_dy_2d(by)
+
+    def _idct2(self, value_hat: torch.Tensor) -> torch.Tensor:
+        return self._idct1(self._idct1(value_hat, -1), -2)
+
+    def _constant_mode_value(self, value_hat: torch.Tensor) -> torch.Tensor:
+        norm = 4.0 * max(self.Nx - 1, 1) * max(self.Ny - 1, 1)
+        return value_hat[0, 0] / norm
+
+    def _constant_mode_values_by_height(self, value_hat: torch.Tensor) -> torch.Tensor:
+        norm = 4.0 * max(self.Nx - 1, 1) * max(self.Ny - 1, 1)
+        return value_hat[..., 0, 0] / norm
+
+    def _as_background_volume(self, value, *, name: str) -> torch.Tensor:
+        field = torch.as_tensor(value, device=self.device, dtype=self.dtype)
+        expected = (3, self.Nz, self.Ny, self.Nx)
+        if tuple(field.shape) != expected:
+            raise ValueError(f"{name} must have shape {expected}; got {tuple(field.shape)}")
+        return field.clone()
+
+    def _handle_projected_zero_mode(
+        self, *, ratio: float, tolerance: float, policy: str, message: str
+    ) -> None:
+        if ratio <= tolerance:
+            return
+        detail = f"{message} ratio={ratio:.6e} exceeds tolerance={tolerance:.6e}."
+        if policy == "error":
+            raise ValueError(detail)
+        if policy == "warn_project":
+            warnings.warn(detail + " The incompatible zero mode will be projected out.",
+                          RuntimeWarning, stacklevel=3)
+
+    def set_bottom_boundary(
+        self,
+        Bz_obs,
+        Jz_obs=None,
+        zero_net_current: Optional[bool] = None,
+        *,
+        Bx_obs=None,
+        By_obs=None,
+        smooth_passes: Optional[int] = None,
+        padded_buffer_zone: Optional[bool] = None,
+        ijzbcor: int = 3,
+    ):
+        """Set the required vector boundary and construct the NFGS split.
+
+        ``Bx_obs`` and ``By_obs`` are mandatory because Gaussian separation
+        needs the horizontal divergence in addition to ``Bz_obs``.
+        """
+        if Bx_obs is None or By_obs is None:
+            raise ValueError(
+                "NFGS requires Bx_obs and By_obs; use set_bottom_vector_boundary() "
+                "or pass both tangential components to set_bottom_boundary()."
+            )
+
+        self._stable_cfcf_boundary = {
+            "Bx_obs": Bx_obs,
+            "By_obs": By_obs,
+            "Bz_obs": Bz_obs,
+            "zero_net_current": zero_net_current,
+            "smooth_passes": smooth_passes,
+            "padded_buffer_zone": padded_buffer_zone,
+            "ijzbcor": ijzbcor,
+        }
+
+        out = super().set_bottom_boundary(
+            Bz_obs=Bz_obs,
+            Jz_obs=Jz_obs,
+            zero_net_current=zero_net_current,
+            Bx_obs=Bx_obs,
+            By_obs=By_obs,
+            smooth_passes=smooth_passes,
+            padded_buffer_zone=padded_buffer_zone,
+            ijzbcor=ijzbcor,
+        )
+        if self.source_partition_mode == "gaussian_separated":
+            self._configure_gaussian_background()
+        else:
+            self._configure_legacy_single_field_background()
+        self._B = None
+        self._J = None
+        self._Phi_c = None
+        self._Az = None
+        self._last_Bc_z = None
+        self._init_diagnostics = None
+        self._source_zero_mode_history = []
+        self._last_source_zero_mode_by_height = []
+        self._bottom_divergence_projection_history = []
+        return out
+
+    def _configure_legacy_single_field_background(self) -> None:
+        """Configure a same-code PT bridge with Gaussian separation disabled.
+
+        The full potential field generated by the inherited boundary path is
+        retained as the fixed background and the current-carrying poloidal
+        correction has homogeneous bottom normal field, matching the
+        conventional single-field PT split.  This branch exists only for the
+        factorized referee ablation; it is not the production NFGS default.
+        """
+        if self.Bx_obs is None or self.By_obs is None or self.Bz_obs is None:
+            raise RuntimeError("Processed vector boundary is unavailable")
+        if self.B_pot is None or self.Phi_pot is None:
+            raise RuntimeError("Inherited potential background is unavailable")
+
+        background = self.B_pot.clone()
+        phi_background = self.Phi_pot.clone()
+        zeros_volume = torch.zeros_like(background)
+        zeros_plane = torch.zeros(
+            (self.Ny, self.Nx), device=self.device, dtype=self.dtype
+        )
+        lam = self._endpoint_neumann_lam_xy().to(dtype=self.dtype)
+        self._nfgs_k = torch.sqrt(torch.clamp(-lam, min=0.0))
+        self.B_mean = torch.stack(
+            [self.Bx_obs.mean(), self.By_obs.mean(), self.Bz_obs.mean()]
+        )
+        self.Bh_mean_bottom = self.B_mean[:2].clone()
+        self.Bz_open_mean = torch.zeros((), device=self.device, dtype=self.dtype)
+        self.B_below = background
+        self.B_open = zeros_volume.clone()
+        self.B_external_harmonic = zeros_volume.clone()
+        self.B_background = background
+        self.B_pot = background
+        self.Phi_pot = phi_background
+        self.Bz_below = self.Bz_obs.clone()
+        self.Bz_above = zeros_plane.clone()
+        self.Phi_below_bottom = phi_background[0].clone()
+        self.Phi_above_bottom = zeros_plane.clone()
+        self.Phi_bottom = phi_background[0].clone()
+        self._phi_below_hat = self._dct2(self.Phi_below_bottom)
+        self._phi_above_hat = torch.zeros_like(self._phi_below_hat)
+        self._bottom_dphi_c_target = zeros_plane.clone()
+        self.D0 = self._d_dx_2d(self.Bx_obs) + self._d_dy_2d(self.By_obs)
+        self._H_k0 = None
+        self._k0_diagnostics = {}
+        self.gaussian_separation_diagnostics = {
+            "source_partition_mode": "legacy_single_field",
+            "gaussian_separation_enabled": False,
+            "bottom_reconstruction_rms": float(
+                torch.sqrt(torch.mean((background[2, 0] - self.Bz_obs) ** 2)).item()
+            ),
+            "mean_field": [float(value.item()) for value in self.B_mean],
+        }
+        self._reset_boundary_hat_cache()
+
+    def set_bottom_vector_boundary(self, Bx_obs, By_obs, Bz_obs, **kwargs):
+        """Set NFGS from vector magnetogram maps in ``(Ny, Nx)`` order."""
+        return self.set_bottom_boundary(
+            Bz_obs=Bz_obs,
+            Jz_obs=None,
+            Bx_obs=Bx_obs,
+            By_obs=By_obs,
+            **kwargs,
+        )
+
+    def _configure_gaussian_background(self) -> None:
+        if self.Bx_obs is None or self.By_obs is None or self.Bz_obs is None:
+            raise RuntimeError("Processed vector boundary is unavailable")
+
+        bx_hat = self._dct2(self.Bx_obs)
+        by_hat = self._dct2(self.By_obs)
+        bz_hat = self._dct2(self.Bz_obs)
+        self.B_mean = torch.stack(
+            [
+                self._constant_mode_value(bx_hat),
+                self._constant_mode_value(by_hat),
+                self._constant_mode_value(bz_hat),
+            ]
+        )
+        self.Bh_mean_bottom = self.B_mean[:2].clone()
+
+        use_external = (
+            self.mean_bz_policy == "external_potential"
+            or self.horizontal_zero_mode_policy == "external_potential"
+        )
+        external = torch.zeros(
+            (3, self.Nz, self.Ny, self.Nx), device=self.device, dtype=self.dtype
+        )
+        if use_external:
+            if self._external_potential_field_input is None:
+                raise ValueError(
+                    "external_potential_field is required when an external_potential "
+                    "mean-mode policy is selected"
+                )
+            external = self._as_background_volume(
+                self._external_potential_field_input,
+                name="external_potential_field",
+            )
+        elif self._external_potential_field_input is not None:
+            raise ValueError(
+                "external_potential_field was supplied but neither mean-mode policy "
+                "selects 'external_potential'"
+            )
+
+        user_horizontal = torch.zeros_like(external)
+        if self.horizontal_zero_mode_policy == "user_supplied":
+            if self._user_supplied_horizontal_field is None:
+                raise ValueError(
+                    "user_supplied_horizontal_field is required for "
+                    "horizontal_zero_mode_policy='user_supplied'"
+                )
+            supplied = torch.as_tensor(
+                self._user_supplied_horizontal_field,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            if tuple(supplied.shape) == (2,):
+                user_horizontal[:2] = supplied[:, None, None, None]
+            elif tuple(supplied.shape) == (2, self.Nz, self.Ny, self.Nx):
+                user_horizontal[:2] = supplied
+            else:
+                raise ValueError(
+                    "user_supplied_horizontal_field must have shape (2,) or "
+                    f"{(2, self.Nz, self.Ny, self.Nx)}; got {tuple(supplied.shape)}"
+                )
+
+        supplemental = external + user_horizontal
+        bx_residual = self.Bx_obs - supplemental[0, 0]
+        by_residual = self.By_obs - supplemental[1, 0]
+        bz_residual = self.Bz_obs - supplemental[2, 0]
+        residual_bz_hat = self._dct2(bz_residual)
+        residual_mean = self._constant_mode_value(residual_bz_hat)
+        residual_bz_scale = float(
+            torch.clamp(torch.sqrt(torch.mean(bz_residual**2)), min=1.0e-30).item()
+        )
+        residual_flux_imbalance = float(
+            (torch.abs(bz_residual.sum()) /
+             torch.clamp(torch.abs(bz_residual).sum(), min=1.0e-30)).item()
+        )
+
+        if self.mean_bz_policy in ("uniform_open", "require_balanced"):
+            if (
+                self.mean_bz_policy == "require_balanced"
+                and residual_flux_imbalance > self.mean_mode_tolerance
+            ):
+                raise ValueError(
+                    "The residual bottom Bz is not flux balanced: "
+                    f"fraction={residual_flux_imbalance:.6e}, "
+                    f"tolerance={self.mean_mode_tolerance:.6e}."
+                )
+            self.Bz_open_mean = residual_mean.clone()
+        elif self.mean_bz_policy == "external_potential":
+            residual_ratio = float(torch.abs(residual_mean).item()) / residual_bz_scale
+            if residual_ratio > self.mean_mode_tolerance:
+                raise ValueError(
+                    "external_potential_field does not carry the observed Bz zero mode: "
+                    f"residual ratio={residual_ratio:.6e}, "
+                    f"tolerance={self.mean_mode_tolerance:.6e}."
+                )
+            self.Bz_open_mean = torch.zeros((), device=self.device, dtype=self.dtype)
+        else:
+            if self._user_supplied_open_bz is None:
+                raise ValueError(
+                    "user_supplied_open_bz is required for "
+                    "mean_bz_policy='user_supplied'"
+                )
+            self.Bz_open_mean = torch.as_tensor(
+                self._user_supplied_open_bz, device=self.device, dtype=self.dtype
+            ).reshape(())
+            unmatched = residual_mean - self.Bz_open_mean
+            unmatched_ratio = float(torch.abs(unmatched).item()) / residual_bz_scale
+            if unmatched_ratio > self.mean_mode_tolerance:
+                raise ValueError(
+                    "user_supplied_open_bz does not match the residual Bz zero mode: "
+                    f"ratio={unmatched_ratio:.6e}, "
+                    f"tolerance={self.mean_mode_tolerance:.6e}."
+                )
+
+        # The k=0 mode is carried explicitly by B_open/external background.
+        bz_nonmean_hat = residual_bz_hat.clone()
+        bz_nonmean_hat[0, 0] = 0.0
+
+        if self.gaussian_horizontal_operator == "spectral":
+            d_hat = self._spectral_div_xy_hat(bx_residual, by_residual)
+            self.D0 = self._idct2(d_hat)
+        else:
+            self.D0 = self._d_dx_2d(bx_residual) + self._d_dy_2d(by_residual)
+            d_hat = self._dct2(self.D0)
+        d0_mean = self._constant_mode_value(d_hat)
+        d0_rms = torch.sqrt(torch.mean(self.D0**2))
+        d0_ratio = float(
+            (torch.abs(d0_mean) / torch.clamp(d0_rms, min=1.0e-30)).item()
+        )
+        self._handle_projected_zero_mode(
+            ratio=d0_ratio,
+            tolerance=self.mean_mode_tolerance,
+            policy=self.d0_zero_mode_policy,
+            message=(
+                "The bottom vector field is incompatible with the zero-mean "
+                "endpoint-Neumann GS model"
+            ),
+        )
+        d_hat[0, 0] = 0.0
+
+        lam_xy = self._endpoint_neumann_lam_xy().to(dtype=self.dtype)
+        k = torch.sqrt(torch.clamp(-lam_xy, min=0.0))
+        k_safe = k.clone()
+        k_safe[0, 0] = 1.0
+        lam_safe = lam_xy.clone()
+        lam_safe[0, 0] = 1.0
+        self._nfgs_k = k
+
+        # Target correction derivative for preserving the representable part
+        # of the observed horizontal divergence.  With
+        # B_h^P=-grad_h(dPhi/dz), D0=-lap_xy(dPhi/dz).  Use the same modal
+        # operator as the separation, then subtract the actual finite-z
+        # derivative of the fixed below-source background.
+        dphi_total_hat = -d_hat / lam_safe
+        dphi_total_hat[0, 0] = 0.0
+
+        bz_below_hat = 0.5 * (bz_nonmean_hat + d_hat / k_safe)
+        bz_above_hat = 0.5 * (bz_nonmean_hat - d_hat / k_safe)
+        bz_below_hat[0, 0] = 0.0
+        bz_above_hat[0, 0] = 0.0
+
+        phi_below_hat = bz_below_hat / lam_safe
+        phi_above_hat = bz_above_hat / lam_safe
+        phi_below_hat[0, 0] = 0.0
+        phi_above_hat[0, 0] = 0.0
+        self._phi_below_hat = phi_below_hat.clone()
+        self._phi_above_hat = phi_above_hat.clone()
+
+        self.Bz_below = self._idct2(bz_below_hat)
+        self.Bz_above = self._idct2(bz_above_hat)
+        self.Phi_below_bottom = self._idct2(phi_below_hat)
+        self.Phi_above_bottom = self._idct2(phi_above_hat)
+
+        z = torch.arange(self.Nz, device=self.device, dtype=self.dtype) * float(self.dz)
+        decay = torch.exp(-z[:, None, None] * k[None, :, :])
+        phi_below = self._idct2(decay * phi_below_hat[None, :, :])
+        bz_below = self._idct2(decay * bz_below_hat[None, :, :])
+        if self.gaussian_horizontal_operator == "spectral":
+            # Modal dPhi/dz = -k Phi for the upward-decaying below field.
+            dphi_dz = self._idct2((-k)[None, :, :] * decay * phi_below_hat[None, :, :])
+            gx, gy = self._spectral_grad_xy(dphi_dz)
+            bx_below, by_below = -gx, -gy
+        else:
+            zeros = torch.zeros_like(phi_below)
+            bx_below, by_below = self._compute_B_horizontal(phi_below, zeros)
+        b_below = torch.stack([bx_below, by_below, bz_below])
+        self.B_below = b_below
+
+        self.B_open = torch.zeros_like(b_below)
+        self.B_open[2] = self.Bz_open_mean
+        self.B_external_harmonic = supplemental.clone()
+        self.B_background = self.B_below + self.B_open + self.B_external_harmonic
+
+        # Phi_pot represents B_below only.  The null-space fields are explicit
+        # tensor components and B_pot is always the complete fixed background.
+        self.Phi_pot = phi_below
+        self._bottom_dphi_c_target = (
+            self._idct2(dphi_total_hat) - self._d_dz_centered(phi_below)[0]
+        )
+        self.Phi_bottom = self.Phi_below_bottom + self.Phi_above_bottom
+        self.B_pot = self.B_background
+        self._reset_boundary_hat_cache()
+
+        reconstruction = self.B_background[2, 0] + self.Bz_above - self.Bz_obs
+        b_from_phi = torch.stack(
+            [bx_below, by_below, self._lap_xy(phi_below)]
+        )
+        phi_background_invariant = (
+            b_from_phi + self.B_open + self.B_external_harmonic
+            - self.B_background
+        )
+        self.gaussian_separation_diagnostics = {
+            "bottom_reconstruction_rms": float(
+                torch.sqrt(torch.mean(reconstruction**2)).item()
+            ),
+            "bottom_reconstruction_max": float(reconstruction.abs().max().item()),
+            "mean_field": [float(v.item()) for v in self.B_mean],
+            "dct_zero_mode_Bx": float(self.B_mean[0].item()),
+            "dct_zero_mode_By": float(self.B_mean[1].item()),
+            "dct_zero_mode_Bz": float(self.B_mean[2].item()),
+            "arithmetic_mean_B": [
+                float(self.Bx_obs.mean().item()),
+                float(self.By_obs.mean().item()),
+                float(self.Bz_obs.mean().item()),
+            ],
+            "mean_bz_policy": self.mean_bz_policy,
+            "horizontal_zero_mode_policy": self.horizontal_zero_mode_policy,
+            "gaussian_horizontal_operator": self.gaussian_horizontal_operator,
+            "Bz_open_mean": float(self.Bz_open_mean.item()),
+            "Bh_mean_bottom": [float(v.item()) for v in self.Bh_mean_bottom],
+            "flux_imbalance_fraction": residual_flux_imbalance,
+            "D0_zero_mode": float(d0_mean.item()),
+            "D0_zero_mode_ratio": d0_ratio,
+            "d0_removed_constant_mode": float(d0_mean.item()),
+            "background_scalar_plus_explicit_rms": float(
+                torch.sqrt(torch.mean(phi_background_invariant**2)).item()
+            ),
+        }
+        self.gaussian_separation_diagnostics.update(
+            self._compute_bottom_harmonic_diagnostics()
+        )
+        if self.horizontal_zero_mode_policy == "coupled_k0":
+            self._initialize_coupled_k0()
+        elif self.horizontal_zero_mode_policy == "frozen_linear_harmonic":
+            self._initialize_frozen_linear_harmonic()
+        elif self.horizontal_zero_mode_policy == "constrained_spline_harmonic":
+            self._initialize_constrained_spline_harmonic()
+        else:
+            self._H_k0 = None
+            self._k0_diagnostics = {}
+
+    def gaussian_above_bottom_field(self) -> torch.Tensor:
+        """Return the endpoint-Neumann DCT ``B^>`` vector on ``z=0``.
+
+        Shape is ``(3, Ny, Nx)``.  Horizontal components use the same
+        poloidal reconstruction as ``_compute_bottom_harmonic_diagnostics``
+        (``dPhi/dz = k Phi^>``, ``B_h = -grad_h(dPhi/dz)``); the vertical
+        component is ``Bz_above``.  This is the non-periodic finite-patch
+        counterpart of CICCI ``B_gt``.
+        """
+        if self.source_partition_mode != "gaussian_separated":
+            raise RuntimeError(
+                "Gaussian B^> is undefined when source_partition_mode="
+                "'legacy_single_field'"
+            )
+        if (
+            self.Bz_above is None
+            or self._phi_above_hat is None
+            or self._nfgs_k is None
+        ):
+            raise RuntimeError("NFGS Gaussian separation is not configured")
+        dphi_dz = self._idct2(self._nfgs_k * self._phi_above_hat)
+        gx, gy = self._horizontal_grad_xy(dphi_dz)
+        return torch.stack([-gx, -gy, self.Bz_above], dim=0)
+
+    def _apply_bottom_divergence_projection(
+        self, phi_c: torch.Tensor
+    ) -> torch.Tensor:
+        """Project bottom ``dPhi_c/dz`` toward the observed-divergence target.
+
+        The bottom Dirichlet value is retained exactly.  For the second-order
+        one-sided derivative ``(-3 p0 + 4 p1 - p2)/(2 dz)``, the changes to
+        planes 1 and 2 are the minimum-norm solution that removes the selected
+        fraction of the derivative residual.  Weight zero is a strict no-op;
+        weight one is the corresponding local projection.
+        """
+        weight = self.bottom_divergence_projection_weight
+        if weight == 0.0:
+            return phi_c
+        if self._bottom_dphi_c_target is None:
+            raise RuntimeError("Bottom divergence target is unavailable")
+        if phi_c.shape[0] < 3:
+            raise ValueError("Bottom divergence control requires Nz >= 3")
+
+        current = (
+            -3.0 * phi_c[0] + 4.0 * phi_c[1] - phi_c[2]
+        ) / (2.0 * float(self.dz))
+        residual = self._bottom_dphi_c_target - current
+        corrected = phi_c.clone()
+        corrected[1] += (8.0 * float(self.dz) / 17.0) * weight * residual
+        corrected[2] -= (2.0 * float(self.dz) / 17.0) * weight * residual
+        corrected[0] = self.Phi_above_bottom
+
+        post = (
+            -3.0 * corrected[0] + 4.0 * corrected[1] - corrected[2]
+        ) / (2.0 * float(self.dz))
+        pre_rms = torch.sqrt(torch.mean(residual**2))
+        post_rms = torch.sqrt(
+            torch.mean((self._bottom_dphi_c_target - post) ** 2)
+        )
+        increment_rms = torch.sqrt(torch.mean((corrected - phi_c) ** 2))
+        self._bottom_divergence_projection_history.append(
+            {
+                "pre_derivative_rms": float(pre_rms.item()),
+                "post_derivative_rms": float(post_rms.item()),
+                "increment_rms": float(increment_rms.item()),
+            }
+        )
+        return corrected
+
+    def _compute_bottom_harmonic_diagnostics(self) -> dict:
+        """Measure the unrepresented finite-domain harmonic bottom field."""
+        if (
+            self._phi_below_hat is None
+            or self._phi_above_hat is None
+            or self._nfgs_k is None
+            or self.Az_bottom is None
+            or self.B_external_harmonic is None
+        ):
+            return {}
+
+        dphi_dz_hat = self._nfgs_k * (
+            self._phi_above_hat - self._phi_below_hat
+        )
+        dphi_dz = self._idct2(dphi_dz_hat)
+        gx, gy = self._horizontal_grad_xy(dphi_dz)
+        bp_x, bp_y = -gx, -gy
+        bt_x = self._d_dy_2d(self.Az_bottom)
+        bt_y = -self._d_dx_2d(self.Az_bottom)
+        reconstructed_h = torch.stack([bp_x + bt_x, bp_y + bt_y])
+        reconstructed_h += self.B_external_harmonic[:2, 0]
+        observed_h = torch.stack([self.Bx_obs, self.By_obs])
+        residual_h = observed_h - reconstructed_h
+
+        residual_constant = torch.stack(
+            [
+                self._constant_mode_value(self._dct2(residual_h[0])),
+                self._constant_mode_value(self._dct2(residual_h[1])),
+            ]
+        )
+        residual_nonconstant = residual_h - residual_constant[:, None, None]
+        self._H_k0_bottom_target = residual_constant.detach().clone()
+        divergence = self._horizontal_div_xy(residual_h[0], residual_h[1])
+        curl_z = self._d_dx_2d(residual_h[1]) - self._d_dy_2d(residual_h[0])
+
+        def rms(value: torch.Tensor) -> torch.Tensor:
+            return torch.sqrt(torch.mean(value**2))
+
+        residual_rms = rms(residual_h)
+        observed_rms = rms(observed_h)
+        residual_ratio = float(
+            (residual_rms / torch.clamp(observed_rms, min=1.0e-30)).item()
+        )
+        if residual_ratio > self.mean_mode_tolerance:
+            message = (
+                "Bottom horizontal reconstruction leaves a finite-domain harmonic "
+                f"residual ratio={residual_ratio:.6e}, "
+                f"tolerance={self.mean_mode_tolerance:.6e}."
+            )
+            if self.harmonic_residual_policy == "error":
+                raise ValueError(message)
+            if self.harmonic_residual_policy == "warn":
+                warnings.warn(message, RuntimeWarning, stacklevel=3)
+
+        return {
+            "bottom_horizontal_reconstruction_rms": float(residual_rms.item()),
+            "bottom_horizontal_reconstruction_ratio": residual_ratio,
+            "harmonic_residual_constant": [
+                float(v.item()) for v in residual_constant
+            ],
+            "harmonic_residual_constant_rms": float(rms(residual_constant).item()),
+            "harmonic_residual_nonconstant_rms": float(
+                rms(residual_nonconstant).item()
+            ),
+            "harmonic_residual_divergence_rms": float(rms(divergence).item()),
+            "harmonic_residual_curl_rms": float(rms(curl_z).item()),
+        }
+
+    def _initialize_coupled_k0(self) -> None:
+        """Initialize and factor the z-coupled horizontal k_h=0 solve."""
+        if self._H_k0_bottom_target is None:
+            raise RuntimeError("Bottom harmonic residual is unavailable")
+        self._H_k0 = self._H_k0_bottom_target[:, None].expand(-1, self.Nz).clone()
+        self._k0_ode_residual_history = []
+        if self.coupled_k0_discretization == "legacy_plane_centred":
+            self._initialize_coupled_k0_legacy_plane_centred()
+        else:
+            self._initialize_coupled_k0_staggered_face()
+
+    def _initialize_frozen_linear_harmonic(self) -> None:
+        """Carry the bottom horizontal harmonic residual without mean current.
+
+        The corresponding analytic vector-potential lift is
+
+        ``A_z^harm = H_x (y-y_c) - H_y (x-x_c)``.
+
+        Keeping ``H`` constant with height gives the requested uniform
+        horizontal field while making ``curl(B_harm)`` identically zero.  The
+        lift is kept outside the homogeneous DST/DCT scalar arrays so it does
+        not change their lateral boundary or null-space contracts.
+        """
+        if self._H_k0_bottom_target is None:
+            raise RuntimeError("Bottom harmonic residual is unavailable")
+        self._H_k0 = self._H_k0_bottom_target[:, None].expand(-1, self.Nz).clone()
+        self._k0_ode_residual_history = []
+        self._k0_diagnostics = {
+            "enabled": True,
+            "closure": "frozen_linear_harmonic",
+            "representation": "analytic_Az_linear_lift",
+            "bottom_target": [
+                float(v.item()) for v in self._H_k0_bottom_target
+            ],
+            "current_free": True,
+            "open_side_current": False,
+            "top_derivative": [0.0, 0.0],
+            "profile_max_abs": float(self._H_k0.abs().max().item()),
+        }
+
+    @staticmethod
+    def _open_uniform_cubic_bspline_basis(
+        n_points: int,
+        n_basis: int,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return a clamped, open-uniform cubic B-spline collocation matrix."""
+        degree = 3
+        interior_count = n_basis - degree - 1
+        knots = [0.0] * (degree + 1)
+        if interior_count > 0:
+            knots.extend(
+                float(i) / float(interior_count + 1)
+                for i in range(1, interior_count + 1)
+            )
+        knots.extend([1.0] * (degree + 1))
+        knot = torch.tensor(knots, device=device, dtype=torch.float64)
+        t = torch.linspace(0.0, 1.0, n_points, device=device, dtype=torch.float64)
+        width = knot.numel() - 1
+        basis = torch.zeros((n_points, width), device=device, dtype=torch.float64)
+        for i in range(width):
+            basis[:, i] = ((t >= knot[i]) & (t < knot[i + 1])).to(torch.float64)
+        basis[-1, -1] = 1.0
+        for order in range(1, degree + 1):
+            next_basis = torch.zeros(
+                (n_points, width - 1), device=device, dtype=torch.float64
+            )
+            for i in range(width - 1):
+                left_den = float(knot[i + order] - knot[i])
+                right_den = float(knot[i + order + 1] - knot[i + 1])
+                if left_den > 0.0:
+                    next_basis[:, i] += (
+                        (t - knot[i]) / left_den * basis[:, i]
+                    )
+                if right_den > 0.0:
+                    next_basis[:, i] += (
+                        (knot[i + order + 1] - t)
+                        / right_den
+                        * basis[:, i + 1]
+                    )
+            basis = next_basis
+            width -= 1
+            basis[-1] = 0.0
+            basis[-1, -1] = 1.0
+        if tuple(basis.shape) != (n_points, n_basis):
+            raise RuntimeError(
+                f"Unexpected cubic B-spline basis shape {tuple(basis.shape)}"
+            )
+        return basis
+
+    def _initialize_constrained_spline_harmonic(self) -> None:
+        """Initialize the low-dimensional coupled harmonic closure.
+
+        The field profile is represented by a cubic B-spline.  Two exact
+        discrete constraints fix the observed bottom residual and impose the
+        same one-sided top derivative used by the returned current, so the
+        explicit harmonic current is compatible with the zero-current top.
+        """
+        if self._H_k0_bottom_target is None:
+            raise RuntimeError("Bottom harmonic residual is unavailable")
+        work_dtype = torch.float64
+        nz = int(self.Nz)
+        dz = float(self.dz)
+        basis = self._open_uniform_cubic_bspline_basis(
+            nz, self.k0_spline_basis_size, device=self.device
+        )
+        derivative = torch.zeros((nz - 1, nz), device=self.device, dtype=work_dtype)
+        rows = torch.arange(nz - 1, device=self.device)
+        derivative[rows, rows] = -1.0 / dz
+        derivative[rows, rows + 1] = 1.0 / dz
+        curvature = torch.zeros((nz - 2, nz), device=self.device, dtype=work_dtype)
+        if nz >= 3:
+            rows = torch.arange(nz - 2, device=self.device)
+            curvature[rows, rows] = 1.0 / dz
+            curvature[rows, rows + 1] = -2.0 / dz
+            curvature[rows, rows + 2] = 1.0 / dz
+
+        pieces = [derivative @ basis]
+        if self.k0_ode_smoothness > 0.0 and curvature.size(0) > 0:
+            pieces.append((self.k0_ode_smoothness ** 0.5) * (curvature @ basis))
+        design = torch.cat(pieces, dim=0)
+        normal = design.transpose(0, 1) @ design
+        ridge = max(float(torch.diagonal(normal).abs().max().item()), 1.0) * 1.0e-12
+        normal = normal + ridge * torch.eye(
+            self.k0_spline_basis_size, device=self.device, dtype=work_dtype
+        )
+
+        top_d1 = torch.zeros(nz, device=self.device, dtype=work_dtype)
+        top_d1[-1] = 3.0 / (2.0 * dz)
+        top_d1[-2] = -4.0 / (2.0 * dz)
+        top_d1[-3] = 1.0 / (2.0 * dz)
+        constraints = torch.stack([basis[0], top_d1 @ basis])
+        zeros = torch.zeros((2, 2), device=self.device, dtype=work_dtype)
+        kkt = torch.cat(
+            [
+                torch.cat([normal, constraints.transpose(0, 1)], dim=1),
+                torch.cat([constraints, zeros], dim=1),
+            ],
+            dim=0,
+        )
+
+        self._H_k0 = self._H_k0_bottom_target[:, None].expand(-1, nz).clone()
+        self._k0_ode_residual_history = []
+        self._k0_face_derivative_matrix = derivative
+        self._k0_curvature_matrix = curvature
+        self._k0_centered_derivative_matrix = None
+        self._k0_spline_basis = basis
+        self._k0_spline_design = design
+        self._k0_spline_constraints = constraints
+        self._k0_spline_kkt = kkt
+        self._k0_diagnostics = {
+            "enabled": True,
+            "closure": "constrained_spline_harmonic",
+            "representation": "cubic_bspline_explicit_linear_harmonic_lift",
+            "basis_size": self.k0_spline_basis_size,
+            "smoothness": self.k0_ode_smoothness,
+            "update_mu": self.k0_update_mu,
+            "bottom_target": [
+                float(v.item()) for v in self._H_k0_bottom_target
+            ],
+            "bottom_constraint": "exact",
+            "top_constraint": "discrete_second_order_Hprime_zero",
+            "lateral_current_contract": "open_harmonic_plus_closed_PT",
+            "open_side_current": True,
+            "top_derivative": [0.0, 0.0],
+            "kkt_condition_number": float(torch.linalg.cond(kkt).item()),
+        }
+
+    def _solve_constrained_spline_profile(
+        self, derivative_target: torch.Tensor, bottom_value: torch.Tensor
+    ) -> torch.Tensor:
+        if (
+            self._k0_spline_basis is None
+            or self._k0_spline_design is None
+            or self._k0_spline_constraints is None
+            or self._k0_spline_kkt is None
+            or self._k0_curvature_matrix is None
+        ):
+            raise RuntimeError("constrained spline harmonic operator is not initialized")
+        q = derivative_target.to(dtype=torch.float64)
+        if tuple(q.shape) != (self.Nz,):
+            raise ValueError(f"derivative_target must have shape {(self.Nz,)}")
+        q_face = 0.5 * (q[:-1] + q[1:])
+        rhs_pieces = [q_face]
+        if self.k0_ode_smoothness > 0.0 and self._k0_curvature_matrix.size(0) > 0:
+            rhs_pieces.append(
+                torch.zeros(
+                    self._k0_curvature_matrix.size(0),
+                    device=self.device,
+                    dtype=torch.float64,
+                )
+            )
+        rhs = torch.cat(rhs_pieces)
+        normal_rhs = self._k0_spline_design.transpose(0, 1) @ rhs
+        constraint_rhs = torch.stack(
+            [bottom_value.to(dtype=torch.float64).reshape(()), normal_rhs.new_zeros(())]
+        )
+        solution = torch.linalg.solve(
+            self._k0_spline_kkt, torch.cat([normal_rhs, constraint_rhs])
+        )
+        profile = self._k0_spline_basis @ solution[: self.k0_spline_basis_size]
+        return profile.to(dtype=self.dtype)
+
+    def _initialize_coupled_k0_staggered_face(self) -> None:
+        """Production face-centred D1 + true three-point curvature."""
+        # A plane-centred derivative has a Nyquist/checkerboard null mode:
+        # D_z (-1)^j = 0 at every interior plane.  Construct the ODE residual
+        # on cell faces instead.  The target supplied at cell centres is
+        # averaged to the same faces in _solve_coupled_k0_profile().
+        work_dtype = torch.float64
+        nz = int(self.Nz)
+        dz = float(self.dz)
+        derivative = torch.zeros(
+            (max(nz - 1, 0), nz), device=self.device, dtype=work_dtype
+        )
+        if nz >= 2:
+            rows = torch.arange(nz - 1, device=self.device)
+            derivative[rows, rows] = -1.0 / dz
+            derivative[rows, rows + 1] = 1.0 / dz
+
+        # This is dz * d^2/dz^2, matching the units in Equation F_h while
+        # retaining the true three-point curvature.  In particular it does
+        # not inherit the checkerboard null space of centred D_z @ D_z.
+        curvature = torch.zeros(
+            (max(nz - 2, 0), nz), device=self.device, dtype=work_dtype
+        )
+        if nz >= 3:
+            rows = torch.arange(nz - 2, device=self.device)
+            curvature[rows, rows] = 1.0 / dz
+            curvature[rows, rows + 1] = -2.0 / dz
+            curvature[rows, rows + 2] = 1.0 / dz
+
+        sqrt_smooth = self.k0_ode_smoothness ** 0.5
+        pieces = [derivative[:, 1:]]
+        if curvature.size(0) > 0 and sqrt_smooth > 0.0:
+            pieces.append(sqrt_smooth * curvature[:, 1:])
+        operator = torch.cat(pieces, dim=0)
+        normal = operator.transpose(0, 1) @ operator
+        self._k0_face_derivative_matrix = derivative
+        self._k0_curvature_matrix = curvature
+        self._k0_centered_derivative_matrix = None
+        self._k0_ode_operator = operator
+        self._k0_ode_cholesky = torch.linalg.cholesky(normal)
+        self._k0_diagnostics = {
+            "enabled": True,
+            "smoothness": self.k0_ode_smoothness,
+            "discretization": "staggered_face_D1_true_three_point_curvature",
+            "bottom_target": [
+                float(v.item()) for v in self._H_k0_bottom_target
+            ],
+            "open_side_current": True,
+        }
+
+    def _initialize_coupled_k0_legacy_plane_centred(self) -> None:
+        """Diagnosis-only plane-centred D1 + composed curvature (checkerboard-prone)."""
+        work_dtype = torch.float64
+        nz = int(self.Nz)
+        dz = float(self.dz)
+        derivative = torch.zeros((nz, nz), device=self.device, dtype=work_dtype)
+        if nz >= 3:
+            rows = torch.arange(1, nz - 1, device=self.device)
+            derivative[rows, rows - 1] = -0.5 / dz
+            derivative[rows, rows + 1] = 0.5 / dz
+            derivative[0, 0] = -1.5 / dz
+            derivative[0, 1] = 2.0 / dz
+            derivative[0, 2] = -0.5 / dz
+            derivative[nz - 1, nz - 1] = 1.5 / dz
+            derivative[nz - 1, nz - 2] = -2.0 / dz
+            derivative[nz - 1, nz - 3] = 0.5 / dz
+        elif nz == 2:
+            derivative[0, 0] = -1.0 / dz
+            derivative[0, 1] = 1.0 / dz
+            derivative[1, 0] = -1.0 / dz
+            derivative[1, 1] = 1.0 / dz
+        # Composed centred second derivative inherits the checkerboard null space.
+        curvature = derivative @ derivative
+        sqrt_smooth = self.k0_ode_smoothness ** 0.5
+        # Residual rows exclude the fixed bottom plane.
+        pieces = [derivative[1:, 1:]]
+        if sqrt_smooth > 0.0 and nz >= 2:
+            pieces.append(sqrt_smooth * curvature[1:, 1:])
+        operator = torch.cat(pieces, dim=0)
+        normal = operator.transpose(0, 1) @ operator
+        self._k0_face_derivative_matrix = None
+        self._k0_curvature_matrix = curvature
+        self._k0_centered_derivative_matrix = derivative
+        self._k0_ode_operator = operator
+        self._k0_ode_cholesky = torch.linalg.cholesky(normal)
+        self._k0_diagnostics = {
+            "enabled": True,
+            "smoothness": self.k0_ode_smoothness,
+            "discretization": "legacy_plane_centred",
+            "bottom_target": [
+                float(v.item()) for v in self._H_k0_bottom_target
+            ],
+            "open_side_current": True,
+            "diagnosis_only": True,
+        }
+
+    def _solve_coupled_k0_profile(
+        self, derivative_target: torch.Tensor, bottom_value: torch.Tensor
+    ) -> torch.Tensor:
+        """Least-squares solve of D_z H=q with H(0) fixed."""
+        if (
+            self._k0_ode_operator is None
+            or self._k0_ode_cholesky is None
+            or self._k0_curvature_matrix is None
+        ):
+            raise RuntimeError("coupled_k0 operator is not initialized")
+        q = derivative_target.to(dtype=torch.float64)
+        h0 = bottom_value.to(dtype=torch.float64)
+        if q.ndim != 1 or q.numel() != self.Nz:
+            raise ValueError(
+                f"derivative_target must have shape {(self.Nz,)}; got {tuple(q.shape)}"
+            )
+        sqrt_smooth = self.k0_ode_smoothness ** 0.5
+        if self.coupled_k0_discretization == "legacy_plane_centred":
+            if self._k0_centered_derivative_matrix is None:
+                raise RuntimeError("legacy coupled_k0 operator is not initialized")
+            derivative = self._k0_centered_derivative_matrix
+            curvature = self._k0_curvature_matrix
+            rhs_pieces = [q[1:] - derivative[1:, 0] * h0]
+            if sqrt_smooth > 0.0:
+                rhs_pieces.append(-sqrt_smooth * curvature[1:, 0] * h0)
+        else:
+            if self._k0_face_derivative_matrix is None:
+                raise RuntimeError("face coupled_k0 operator is not initialized")
+            derivative = self._k0_face_derivative_matrix
+            curvature = self._k0_curvature_matrix
+            q_face = 0.5 * (q[:-1] + q[1:])
+            rhs_pieces = [q_face - derivative[:, 0] * h0]
+            if curvature.size(0) > 0 and sqrt_smooth > 0.0:
+                rhs_pieces.append(-sqrt_smooth * curvature[:, 0] * h0)
+        rhs = torch.cat(rhs_pieces)
+        normal_rhs = self._k0_ode_operator.transpose(0, 1) @ rhs
+        interior = torch.cholesky_solve(
+            normal_rhs[:, None], self._k0_ode_cholesky
+        ).squeeze(1)
+        result = torch.cat([h0.reshape(1), interior])
+        return result.to(dtype=self.dtype)
+
+    def _k0_center_derivative(self, profile: torch.Tensor) -> torch.Tensor:
+        """Map profile differences back to cell centres."""
+        if profile.ndim != 2 or tuple(profile.shape) != (2, self.Nz):
+            raise ValueError(
+                f"profile must have shape {(2, self.Nz)}; got {tuple(profile.shape)}"
+            )
+        if self.coupled_k0_discretization == "legacy_plane_centred":
+            if self._k0_centered_derivative_matrix is None:
+                raise RuntimeError("legacy coupled_k0 operator is not initialized")
+            matrix = self._k0_centered_derivative_matrix.to(dtype=profile.dtype)
+            return (matrix @ profile.transpose(0, 1)).transpose(0, 1)
+
+        derivative = torch.zeros_like(profile)
+        if self.Nz < 2:
+            return derivative
+        face = (profile[:, 1:] - profile[:, :-1]) / float(self.dz)
+        if self.Nz == 2:
+            derivative[:, 0] = face[:, 0]
+            derivative[:, 1] = face[:, 0]
+            return derivative
+        derivative[:, 1:-1] = 0.5 * (face[:, :-1] + face[:, 1:])
+        derivative[:, 0] = (
+            -3.0 * profile[:, 0]
+            + 4.0 * profile[:, 1]
+            - profile[:, 2]
+        ) / (2.0 * float(self.dz))
+        derivative[:, -1] = (
+            3.0 * profile[:, -1]
+            - 4.0 * profile[:, -2]
+            + profile[:, -3]
+        ) / (2.0 * float(self.dz))
+        return derivative
+
+    def _k0_field_and_current(
+        self, profile: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if profile is None:
+            profile = self._H_k0
+        if profile is None:
+            zeros = torch.zeros(
+                (3, self.Nz, self.Ny, self.Nx),
+                device=self.device,
+                dtype=self.dtype,
+            )
+            return zeros, zeros.clone()
+        derivative = self._k0_center_derivative(profile)
+        b_k0 = torch.zeros(
+            (3, self.Nz, self.Ny, self.Nx),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        j_k0 = torch.zeros_like(b_k0)
+        b_k0[:2] = profile[:, :, None, None]
+        j_k0[0] = -derivative[1, :, None, None]
+        j_k0[1] = derivative[0, :, None, None]
+        return b_k0, j_k0
+
+    def _diagnose_source_zero_mode(
+        self, source: torch.Tensor, *, context: str
+    ) -> None:
+        source_hat = self._dct2(source)
+        mean_by_height = self._constant_mode_values_by_height(source_hat)
+        source_rms = torch.sqrt(torch.mean(source**2))
+        zero_rms = torch.sqrt(torch.mean(mean_by_height**2))
+        ratio = float(
+            (zero_rms / torch.clamp(source_rms, min=1.0e-30)).item()
+        )
+        self._last_source_zero_mode_by_height = [
+            float(v.item()) for v in mean_by_height
+        ]
+        self._source_zero_mode_history.append(ratio)
+        self._handle_projected_zero_mode(
+            ratio=ratio,
+            tolerance=self.source_zero_mode_tolerance,
+            policy=self.source_zero_mode_policy,
+            message=f"The {context} nonlinear source has an incompatible zero mode",
+        )
+
+    # ------------------------------------------------------------------
+    # Transparent top solve for Bc_z
+    # ------------------------------------------------------------------
+    def _solve_bcz_robin(
+        self, source: torch.Tensor, bottom_value: torch.Tensor
+    ) -> torch.Tensor:
+        """Solve ``lap(Bc_z)=source`` with bottom Dirichlet and top Robin.
+
+        Horizontal endpoint-Neumann modes are solved independently.  The top
+        condition uses the second-order backward derivative
+
+        ``(3 u_N - 4 u_{N-1} + u_{N-2})/(2 dz) + k u_N = 0``.
+
+        Eliminating ``u_{N-2}`` with the adjacent PDE row keeps the system
+        tridiagonal, so the solve remains a batched Thomas recurrence.
+        """
+        if self.Nz < 3:
+            raise ValueError("NFGS top Robin solve requires Nz >= 3")
+        if tuple(source.shape) != (self.Nz, self.Ny, self.Nx):
+            raise ValueError(
+                f"source must have shape {(self.Nz, self.Ny, self.Nx)}; "
+                f"got {tuple(source.shape)}"
+            )
+        if tuple(bottom_value.shape) != (self.Ny, self.Nx):
+            raise ValueError(
+                f"bottom_value must have shape {(self.Ny, self.Nx)}; "
+                f"got {tuple(bottom_value.shape)}"
+            )
+
+        self._diagnose_source_zero_mode(source, context="Bc_z")
+        source_hat = self._dct2(source)
+        bottom_hat = self._dct2(bottom_value)
+        return self._solve_modal_robin_from_hat(source_hat, bottom_hat)
+
+    def _solve_modal_robin_from_hat(
+        self,
+        source_hat: torch.Tensor,
+        bottom_hat: torch.Tensor,
+        *,
+        top_robin_hat: Optional[torch.Tensor] = None,
+        bottom_derivative_hat: Optional[torch.Tensor] = None,
+        bottom_robin_weight: float = 0.0,
+    ) -> torch.Tensor:
+        """Solve modal ``(d_zz + lambda_xy) u = source`` with top Robin.
+
+        ``top_robin_hat`` prescribes ``(d_z + sqrt(-lambda_xy))u`` on the
+        top plane.  The production NFGS path leaves it unset, which preserves
+        the transparent homogeneous condition.  A nonzero value is useful
+        for method-of-manufactured-solutions verification of the same modal
+        operator.
+
+        When ``bottom_robin_weight`` is nonzero, the first interior PDE row is
+        blended with the second-order bottom derivative condition while the
+        observed bottom Dirichlet value remains exact.  After multiplying by
+        ``dz**2``, the blended first row is
+
+        ``(1-rho) * PDE(z=dz) + rho * (-(d_z u-q)/dz) = 0``.
+
+        Thus rho=0 is the original solver and rho=1 replaces only the first
+        interior PDE row by the derivative condition.  The top Robin row and
+        all higher interior PDE rows are unchanged.
+        """
+        source_hat = source_hat.clone()
+        bottom_hat = bottom_hat.clone()
+        source_hat[:, 0, 0] = 0.0
+        bottom_hat[0, 0] = 0.0
+        if top_robin_hat is None:
+            top_robin_hat = torch.zeros_like(bottom_hat)
+        else:
+            if tuple(top_robin_hat.shape) != (self.Ny, self.Nx):
+                raise ValueError(
+                    "top_robin_hat must have shape "
+                    f"{(self.Ny, self.Nx)}; got {tuple(top_robin_hat.shape)}"
+                )
+            top_robin_hat = top_robin_hat.to(
+                device=self.device, dtype=source_hat.dtype
+            ).clone()
+        top_robin_hat[0, 0] = 0.0
+        rho = float(bottom_robin_weight)
+        if not 0.0 <= rho <= 1.0:
+            raise ValueError("bottom_robin_weight must be between 0 and 1")
+        if rho > 0.0:
+            if bottom_derivative_hat is None:
+                raise ValueError(
+                    "bottom_derivative_hat is required for mixed bottom Robin"
+                )
+            bottom_derivative_hat = bottom_derivative_hat.clone()
+            bottom_derivative_hat[0, 0] = 0.0
+
+        lam = self._endpoint_neumann_lam_xy().to(dtype=source_hat.dtype)
+        if self._nfgs_k is None:
+            k = torch.sqrt(torch.clamp(-lam, min=0.0))
+        else:
+            k = self._nfgs_k.to(dtype=source_hat.dtype)
+
+        dz = float(self.dz)
+        dz2 = dz * dz
+        lower_pde = 1.0 / dz2
+        upper_pde = 1.0 / dz2
+        diag_pde = lam - 2.0 / dz2
+
+        n_unknown = self.Nz - 1
+        cprime = torch.empty(
+            (n_unknown, self.Ny, self.Nx),
+            device=self.device,
+            dtype=source_hat.dtype,
+        )
+        dprime = torch.empty_like(cprime)
+
+        # First unknown plane (z=dz): retain exact u(0), optionally blending
+        # its PDE row with the observed-divergence derivative condition.
+        if rho > 0.0:
+            known_bottom = (1.0 + 0.5 * rho) / dz2
+            first_diag = (1.0 - rho) * lam - 2.0 / dz2
+            first_upper = (1.0 - 0.5 * rho) / dz2
+            first_rhs = (1.0 - rho) * source_hat[1]
+            first_rhs -= rho * bottom_derivative_hat / dz
+            rhs0 = first_rhs - known_bottom * bottom_hat
+        else:
+            first_diag = diag_pde
+            first_upper = upper_pde
+            rhs0 = source_hat[1] - lower_pde * bottom_hat
+        denom = first_diag
+        cprime[0] = first_upper / denom
+        dprime[0] = rhs0 / denom
+
+        # Standard interior rows, excluding the final Robin row.
+        for row in range(1, n_unknown - 1):
+            denom = diag_pde - lower_pde * cprime[row - 1]
+            cprime[row] = upper_pde / denom
+            dprime[row] = (source_hat[row + 1] - lower_pde * dprime[row - 1]) / denom
+
+        # Robin row after eliminating u_{N-2} with the PDE at plane N-1.
+        robin_lower = -lam * dz2 - 2.0
+        robin_diag = 2.0 + 2.0 * dz * k
+        robin_rhs = 2.0 * dz * top_robin_hat - source_hat[-2] * dz2
+        last = n_unknown - 1
+        denom = robin_diag - robin_lower * cprime[last - 1]
+        cprime[last] = 0.0
+        dprime[last] = (robin_rhs - robin_lower * dprime[last - 1]) / denom
+
+        solution_hat = torch.empty_like(source_hat)
+        solution_hat[0] = bottom_hat
+        solution_hat[-1] = dprime[last]
+        for row in range(last - 1, -1, -1):
+            solution_hat[row + 1] = dprime[row] - cprime[row] * solution_hat[row + 2]
+        solution_hat[:, 0, 0] = 0.0
+        return self._idct2(solution_hat)
+
+    def _solve_phi_c_robin(
+        self, source_bcz: torch.Tensor, bottom_phi: torch.Tensor
+    ) -> torch.Tensor:
+        """Solve the correction poloidal scalar with the same top Robin BC.
+
+        Since ``Bc_z = lap_xy(Phi_c)``, ``lap(Bc_z) = source_bcz`` becomes
+        ``(d_zz + lambda_xy) Phi_c = source_bcz / lambda_xy`` per nonzero
+        endpoint-Neumann mode.  Solving this directly prevents a small Robin
+        residual in ``Bc_z`` from being magnified by ``1/lambda_xy`` when Phi
+        is reconstructed plane-by-plane.
+        """
+        if tuple(source_bcz.shape) != (self.Nz, self.Ny, self.Nx):
+            raise ValueError(
+                f"source_bcz must have shape {(self.Nz, self.Ny, self.Nx)}; "
+                f"got {tuple(source_bcz.shape)}"
+            )
+        if tuple(bottom_phi.shape) != (self.Ny, self.Nx):
+            raise ValueError(
+                f"bottom_phi must have shape {(self.Ny, self.Nx)}; "
+                f"got {tuple(bottom_phi.shape)}"
+            )
+        lam = self._endpoint_neumann_lam_xy().to(dtype=source_bcz.dtype)
+        lam_safe = lam.clone()
+        lam_safe[0, 0] = 1.0
+        self._diagnose_source_zero_mode(source_bcz, context="Phi_c")
+        source_hat = self._dct2(source_bcz) / lam_safe[None, :, :]
+        source_hat[:, 0, 0] = 0.0
+        bottom_hat = self._dct2(bottom_phi)
+        bottom_hat[0, 0] = 0.0
+        derivative_hat = None
+        if self.bottom_divergence_robin_weight > 0.0:
+            if self._bottom_dphi_c_target is None:
+                raise RuntimeError("Bottom divergence target is unavailable")
+            derivative_hat = self._dct2(self._bottom_dphi_c_target)
+            derivative_hat[0, 0] = 0.0
+        phi_c = self._solve_modal_robin_from_hat(
+            source_hat,
+            bottom_hat,
+            bottom_derivative_hat=derivative_hat,
+            bottom_robin_weight=self.bottom_divergence_robin_weight,
+        )
+        if self.bottom_divergence_robin_weight > 0.0:
+            # Remove the inverse-DCT roundoff at the prescribed Dirichlet
+            # plane without changing the legacy rho=0 path.
+            phi_c[0] = bottom_phi
+        return phi_c
+
+    def _solve_phi_c_two_stage(
+        self, source_bcz: torch.Tensor, bottom_phi: torch.Tensor
+    ) -> torch.Tensor:
+        """Solve ``B_c,z`` first, then recover ``Phi_c`` plane by plane.
+
+        This is the conditioning-control branch used by the NFGS ablation.
+        It applies the same source, exact bottom Dirichlet data, mixed first
+        row, and transparent top condition as :meth:`_solve_phi_c_robin`.
+        The only changed operation is the explicit modal inversion
+        ``Phi_c_hat = B_c,z_hat / lambda_h`` after the 3-D solve.
+        """
+        if tuple(source_bcz.shape) != (self.Nz, self.Ny, self.Nx):
+            raise ValueError(
+                f"source_bcz must have shape {(self.Nz, self.Ny, self.Nx)}; "
+                f"got {tuple(source_bcz.shape)}"
+            )
+        if tuple(bottom_phi.shape) != (self.Ny, self.Nx):
+            raise ValueError(
+                f"bottom_phi must have shape {(self.Ny, self.Nx)}; "
+                f"got {tuple(bottom_phi.shape)}"
+            )
+
+        self._diagnose_source_zero_mode(source_bcz, context="Phi_c two-stage")
+        source_hat = self._dct2(source_bcz)
+        source_hat[:, 0, 0] = 0.0
+        lam = self._endpoint_neumann_lam_xy().to(dtype=source_hat.dtype)
+        bottom_phi_hat = self._dct2(bottom_phi)
+        bottom_phi_hat[0, 0] = 0.0
+        bottom_bcz_hat = lam * bottom_phi_hat
+
+        derivative_bcz_hat = None
+        if self.bottom_divergence_robin_weight > 0.0:
+            if self._bottom_dphi_c_target is None:
+                raise RuntimeError("Bottom divergence target is unavailable")
+            derivative_phi_hat = self._dct2(self._bottom_dphi_c_target)
+            derivative_phi_hat[0, 0] = 0.0
+            derivative_bcz_hat = lam * derivative_phi_hat
+
+        bcz = self._solve_modal_robin_from_hat(
+            source_hat,
+            bottom_bcz_hat,
+            bottom_derivative_hat=derivative_bcz_hat,
+            bottom_robin_weight=self.bottom_divergence_robin_weight,
+        )
+        bcz_hat = self._dct2(bcz)
+        lam_safe = lam.clone()
+        lam_safe[0, 0] = 1.0
+        phi_hat = bcz_hat / lam_safe[None, :, :]
+        phi_hat[:, 0, 0] = 0.0
+        phi_c = self._idct2(phi_hat)
+        phi_c[0] = bottom_phi
+        return phi_c
+
+    def _solve_phi_c_update(
+        self, source_bcz: torch.Tensor, bottom_phi: torch.Tensor
+    ) -> torch.Tensor:
+        """Dispatch the nonlinear poloidal update selected for ablation."""
+        if self.poloidal_update_mode == "direct":
+            return self._solve_phi_c_robin(source_bcz, bottom_phi)
+        return self._solve_phi_c_two_stage(source_bcz, bottom_phi)
+
+    # ------------------------------------------------------------------
+    # NFGS boundary, initializer, and iteration
+    # ------------------------------------------------------------------
+    def _vertical_staggered_face_state(
+        self, B: torch.Tensor, Jz_center: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return total ``B`` and current-carrying curl on vertical faces.
+
+        The vertical difference is formed directly between adjacent planes,
+        so the one-plane alternating mode is visible instead of belonging to
+        the null space of a plane-centred first derivative.  Horizontal
+        derivatives remain on the established NFGS grid.  The curl is formed
+        from ``B - B_background`` because the Gaussian background is the
+        prescribed current-free component and must not acquire truncation
+        current merely through a change of diagnostic operator.
+        """
+        if B.ndim != 4 or tuple(B.shape) != (3, self.Nz, self.Ny, self.Nx):
+            raise ValueError(
+                "B must have shape "
+                f"{(3, self.Nz, self.Ny, self.Nx)}; got {tuple(B.shape)}"
+            )
+        if self.B_background is None:
+            raise RuntimeError("Gaussian background is not initialized")
+
+        B_face = 0.5 * (B[:, 1:] + B[:, :-1])
+        carrier = B - self.B_background
+        carrier_face = 0.5 * (carrier[:, 1:] + carrier[:, :-1])
+        dBx_dz = (carrier[0, 1:] - carrier[0, :-1]) / float(self.dz)
+        dBy_dz = (carrier[1, 1:] - carrier[1, :-1]) / float(self.dz)
+        Jx_face = self._d_dy_centered(carrier_face[2]) - dBy_dz
+        Jy_face = dBx_dz - self._d_dx_centered(carrier_face[2])
+        if Jz_center is None:
+            Jz_center = (
+                self._d_dx_centered(carrier[1])
+                - self._d_dy_centered(carrier[0])
+            )
+        elif tuple(Jz_center.shape) != (self.Nz, self.Ny, self.Nx):
+            raise ValueError(
+                "Jz_center must have shape "
+                f"{(self.Nz, self.Ny, self.Nx)}"
+            )
+        Jz_face = 0.5 * (Jz_center[1:] + Jz_center[:-1])
+        J_face = torch.stack([Jx_face, Jy_face, Jz_face])
+        return B_face, J_face
+
+    def _vertical_faces_to_centres(self, values: torch.Tensor) -> torch.Tensor:
+        """Conservatively interpolate vertical-face values to solver planes."""
+        expected = (3, self.Nz - 1, self.Ny, self.Nx)
+        if tuple(values.shape) != expected:
+            raise ValueError(f"face values must have shape {expected}")
+        centres = torch.empty(
+            (3, self.Nz, self.Ny, self.Nx),
+            device=values.device,
+            dtype=values.dtype,
+        )
+        centres[:, 0] = values[:, 0]
+        centres[:, -1] = values[:, -1]
+        if self.Nz > 2:
+            centres[:, 1:-1] = 0.5 * (values[:, :-1] + values[:, 1:])
+        return centres
+
+    def _vertical_staggered_current_at_centres(
+        self, B: torch.Tensor, Jz_center: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        B_face, J_face = self._vertical_staggered_face_state(B, Jz_center)
+        J = self._vertical_faces_to_centres(J_face)
+        face_rms = torch.sqrt(torch.mean(J_face.double().square()))
+        cell_rms = torch.sqrt(torch.mean(J.double().square()))
+        self._last_staggered_face_diagnostics = {
+            "operator": "vertical_face_curl_then_conservative_cell_projection",
+            "face_current_rms": float(face_rms.item()),
+            "projected_cell_current_rms": float(cell_rms.item()),
+            "face_planes": int(B_face.shape[1]),
+        }
+        return J
+
+    def compute_parallel_currents(self, J, B):
+        """Project current parallel to ``B`` using the selected z operator."""
+        if self.vertical_current_operator == "collocated_centered":
+            b2 = torch.clamp(
+                torch.sum(B * B, dim=0), min=self.weak_field_floor_b2
+            )
+            alpha = torch.sum(J * B, dim=0) / b2
+            alpha_max = self.alpha_max()
+            if alpha_max is not None and math.isfinite(alpha_max):
+                alpha = torch.clamp(alpha, min=-alpha_max, max=alpha_max)
+            return alpha[None] * B
+        _B_face, J_parallel_face = self._vertical_staggered_parallel_face_current(
+            B, J[2]
+        )
+        return self._vertical_faces_to_centres(J_parallel_face)
+
+    def _vertical_staggered_parallel_face_current(
+        self, B: torch.Tensor, Jz_center: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return face ``B`` and face-aligned current ``alpha_f B_f``."""
+        B_face, J_face = self._vertical_staggered_face_state(B, Jz_center)
+        B2 = torch.clamp(
+            torch.sum(B_face * B_face, dim=0), min=self.weak_field_floor_b2
+        )
+        alpha = torch.sum(J_face * B_face, dim=0) / B2
+        alpha_max = self.alpha_max()
+        if alpha_max is not None and math.isfinite(alpha_max):
+            alpha = torch.clamp(alpha, min=-alpha_max, max=alpha_max)
+        return B_face, alpha[None] * B_face
+
+    def _vertical_face_profile_to_centres(self, values: torch.Tensor) -> torch.Tensor:
+        """Interpolate a vertical-face profile ``(..., Nz-1)`` onto centres."""
+        if values.shape[-1] != self.Nz - 1:
+            raise ValueError(
+                f"face profile trailing size must be {self.Nz - 1}; "
+                f"got {values.shape[-1]}"
+            )
+        centres = torch.empty(
+            (*values.shape[:-1], self.Nz),
+            device=values.device,
+            dtype=values.dtype,
+        )
+        centres[..., 0] = values[..., 0]
+        centres[..., -1] = values[..., -1]
+        if self.Nz > 2:
+            centres[..., 1:-1] = 0.5 * (values[..., :-1] + values[..., 1:])
+        return centres
+
+    def _k0_parallel_current_target(
+        self, J_para_cell: torch.Tensor, B: torch.Tensor, Jz_center: torch.Tensor
+    ) -> torch.Tensor:
+        """Current used as the nonlinear target for the coupled ``H_k0`` ODE.
+
+        For staggered faces, taking the horizontal mean of the face-aligned
+        current (then conservatively mapping those means to centres) avoids the
+        non-commutative cell projection
+        ``I[(J·B/|B|^2)B] ≠ (I J·I B)/|I B|^2 I B`` that otherwise amplifies
+        the mean-mode feedback, especially at ``rho=0``.
+        """
+        if (
+            self.vertical_current_operator != "staggered_face"
+            or self.k0_current_target_placement != "face"
+        ):
+            return J_para_cell
+        _B_face, J_para_face = self._vertical_staggered_parallel_face_current(
+            B, Jz_center
+        )
+        mean_face = J_para_face.mean(dim=(-2, -1))
+        mean_centres = self._vertical_face_profile_to_centres(mean_face)
+        return mean_centres[:, :, None, None].expand_as(J_para_cell)
+
+    def compute_sigma(self, B, J):
+        """Monitor force-freeness on the operator's native placement."""
+        if self.vertical_current_operator == "collocated_centered":
+            return super().compute_sigma(B, J)
+        B_face, J_face = self._vertical_staggered_face_state(B, J[2])
+        sz, sy, sx = self._fortran_cwsin_slices(B_face)
+        b = B_face[:, sz, sy, sx]
+        j = J_face[:, sz, sy, sx]
+        bnorm = torch.linalg.vector_norm(b, dim=0).clamp_min(1.0e-10)
+        jnorm = torch.linalg.vector_norm(j, dim=0)
+        jxb = torch.cross(j.movedim(0, -1), b.movedim(0, -1), dim=-1)
+        numerator = (torch.linalg.vector_norm(jxb, dim=-1) / bnorm).sum()
+        denominator = jnorm.sum().clamp_min(1.0e-30)
+        return float((numerator / denominator).item())
+
+    def _reconstruct_pt_state_from_scalars(self, Phi_c, Az, Bc_z):
+        """Reconstruct only the endpoint-Neumann PT subspace."""
+        return super()._reconstruct_state_from_scalars(Phi_c, Az, Bc_z)
+
+    def _reconstruct_state_from_scalars(self, Phi_c, Az, Bc_z):
+        B, J, B_c = self._reconstruct_pt_state_from_scalars(Phi_c, Az, Bc_z)
+        if self.horizontal_zero_mode_policy in {
+            "coupled_k0",
+            "frozen_linear_harmonic",
+            "constrained_spline_harmonic",
+        }:
+            b_k0, j_k0 = self._k0_field_and_current()
+            B = B + b_k0
+            J = J + j_k0
+            # The PT current remains closed on the side walls.  The explicit
+            # k_h=0 current is horizontally uniform and therefore represents
+            # an open-side mean-current channel.  Bottom Bz/Jz are unchanged.
+            B[2, 0] = self.Bz_obs
+            J[2, 0] = self._bottom_jz_bc()
+            J[:, -1] = 0.0
+        if self.vertical_current_operator == "staggered_face":
+            J_staggered = self._vertical_staggered_current_at_centres(B, J[2])
+            if self.horizontal_zero_mode_policy == "constrained_spline_harmonic":
+                # Close only the PT current on the lateral walls.  The
+                # explicit harmonic current is the analytically admitted
+                # open-side channel and must not be clipped there.
+                _b_harm, j_harm = self._k0_field_and_current()
+                j_pt = J_staggered - j_harm
+                j_pt[:, :, :, 0] = 0.0
+                j_pt[:, :, :, -1] = 0.0
+                j_pt[:, :, 0, :] = 0.0
+                j_pt[:, :, -1, :] = 0.0
+                j_pt[:, -1] = 0.0
+                J = j_pt + j_harm
+                # The spline constraint makes this assignment consistent
+                # with curl(B_harm) to the same one-sided FD2 tolerance.
+                J[:, -1] = 0.0
+            else:
+                J[:2] = J_staggered[:2]
+                J[:, :, :, 0] = 0.0
+                J[:, :, :, -1] = 0.0
+                J[:, :, 0, :] = 0.0
+                J[:, :, -1, :] = 0.0
+                J[:, -1] = 0.0
+            J[2, 0] = self._bottom_jz_bc()
+        return B, J, B_c
+
+    def _horizontal_zero_mode_profiles(self, field: torch.Tensor) -> torch.Tensor:
+        return torch.stack(
+            [
+                self._constant_mode_values_by_height(self._dct2(field[0])),
+                self._constant_mode_values_by_height(self._dct2(field[1])),
+            ]
+        )
+
+    def _update_coupled_k0(
+        self, J_para: torch.Tensor, J_pt_star: torch.Tensor
+    ) -> torch.Tensor:
+        if self._H_k0_bottom_target is None:
+            raise RuntimeError("coupled_k0 bottom target is unavailable")
+        desired_jh = self._horizontal_zero_mode_profiles(J_para)
+        desired_jh -= self._horizontal_zero_mode_profiles(J_pt_star)
+        hx = self._solve_coupled_k0_profile(
+            desired_jh[1], self._H_k0_bottom_target[0]
+        )
+        hy = self._solve_coupled_k0_profile(
+            -desired_jh[0], self._H_k0_bottom_target[1]
+        )
+        profile = torch.stack([hx, hy])
+        _, j_k0 = self._k0_field_and_current(profile)
+        actual_jh = torch.stack([j_k0[0, :, 0, 0], j_k0[1, :, 0, 0]])
+        residual = actual_jh - desired_jh
+        residual_rms = float(torch.sqrt(torch.mean(residual**2)).item())
+        desired_rms = float(torch.sqrt(torch.mean(desired_jh**2)).item())
+        relative = residual_rms / max(desired_rms, 1.0e-30)
+        self._k0_ode_residual_history.append(relative)
+        derivative = self._k0_center_derivative(profile)
+        face_derivative = (profile[:, 1:] - profile[:, :-1]) / float(self.dz)
+        desired_face = torch.stack(
+            [
+                0.5 * (desired_jh[1, :-1] + desired_jh[1, 1:]),
+                -0.5 * (desired_jh[0, :-1] + desired_jh[0, 1:]),
+            ]
+        )
+        face_residual = face_derivative - desired_face
+        face_residual_rms = float(torch.sqrt(torch.mean(face_residual**2)).item())
+        face_target_rms = float(torch.sqrt(torch.mean(desired_face**2)).item())
+        if profile.size(1) >= 3:
+            gridscale = profile[:, 1:-1] - 0.25 * (
+                profile[:, :-2] + 2.0 * profile[:, 1:-1] + profile[:, 2:]
+            )
+            gridscale_rms = float(torch.sqrt(torch.mean(gridscale**2)).item())
+        else:
+            gridscale_rms = 0.0
+        profile_rms = float(torch.sqrt(torch.mean(profile**2)).item())
+        self._k0_diagnostics.update(
+            {
+                "ode_residual_rms": residual_rms,
+                "ode_residual_relative": relative,
+                "ode_residual_relative_max": max(self._k0_ode_residual_history),
+                "face_ode_residual_rms": face_residual_rms,
+                "face_ode_residual_relative": face_residual_rms
+                / max(face_target_rms, 1.0e-30),
+                "gridscale_profile_rms": gridscale_rms,
+                "gridscale_profile_relative": gridscale_rms
+                / max(profile_rms, 1.0e-30),
+                "top_derivative": [float(v.item()) for v in derivative[:, -1]],
+                "profile_max_abs": float(profile.abs().max().item()),
+                "profile_top": [float(v.item()) for v in profile[:, -1]],
+                "desired_mean_current_rms": desired_rms,
+            }
+        )
+        return profile
+
+    def _update_constrained_spline_harmonic(
+        self, J_para: torch.Tensor, J_pt_star: torch.Tensor
+    ) -> torch.Tensor:
+        if self._H_k0_bottom_target is None:
+            raise RuntimeError("constrained spline bottom target is unavailable")
+        desired_jh = self._horizontal_zero_mode_profiles(J_para)
+        desired_jh -= self._horizontal_zero_mode_profiles(J_pt_star)
+        hx = self._solve_constrained_spline_profile(
+            desired_jh[1], self._H_k0_bottom_target[0]
+        )
+        hy = self._solve_constrained_spline_profile(
+            -desired_jh[0], self._H_k0_bottom_target[1]
+        )
+        profile = torch.stack([hx, hy])
+        _, j_harm = self._k0_field_and_current(profile)
+        actual_jh = torch.stack(
+            [j_harm[0, :, 0, 0], j_harm[1, :, 0, 0]]
+        )
+        residual = actual_jh - desired_jh
+        residual_rms = float(torch.sqrt(torch.mean(residual**2)).item())
+        desired_rms = float(torch.sqrt(torch.mean(desired_jh**2)).item())
+        relative = residual_rms / max(desired_rms, 1.0e-30)
+        self._k0_ode_residual_history.append(relative)
+        face_derivative = (profile[:, 1:] - profile[:, :-1]) / float(self.dz)
+        desired_face = torch.stack(
+            [
+                0.5 * (desired_jh[1, :-1] + desired_jh[1, 1:]),
+                -0.5 * (desired_jh[0, :-1] + desired_jh[0, 1:]),
+            ]
+        )
+        face_residual = face_derivative - desired_face
+        face_residual_rms = float(torch.sqrt(torch.mean(face_residual**2)).item())
+        face_target_rms = float(torch.sqrt(torch.mean(desired_face**2)).item())
+        derivative = self._k0_center_derivative(profile)
+        gridscale = profile[:, 1:-1] - 0.25 * (
+            profile[:, :-2] + 2.0 * profile[:, 1:-1] + profile[:, 2:]
+        )
+        gridscale_rms = float(torch.sqrt(torch.mean(gridscale**2)).item())
+        profile_rms = float(torch.sqrt(torch.mean(profile**2)).item())
+        self._k0_diagnostics.update(
+            {
+                "ode_residual_rms": residual_rms,
+                "ode_residual_relative": relative,
+                "ode_residual_relative_max": max(self._k0_ode_residual_history),
+                "face_ode_residual_rms": face_residual_rms,
+                "face_ode_residual_relative": face_residual_rms
+                / max(face_target_rms, 1.0e-30),
+                "gridscale_profile_rms": gridscale_rms,
+                "gridscale_profile_relative": gridscale_rms
+                / max(profile_rms, 1.0e-30),
+                "top_derivative": [float(v.item()) for v in derivative[:, -1]],
+                "profile_max_abs": float(profile.abs().max().item()),
+                "profile_top": [float(v.item()) for v in profile[:, -1]],
+                "desired_mean_current_rms": desired_rms,
+            }
+        )
+        return profile
+
+    def _apply_boundary_conditions(self, B, J):
+        # B_background may cross lateral/top faces.  The modal Bc_z/Phi_c
+        # solves already impose homogeneous lateral correction conditions.
+        J[:, :, :, 0] = 0.0
+        J[:, :, :, -1] = 0.0
+        J[:, :, 0, :] = 0.0
+        J[:, :, -1, :] = 0.0
+        J[:, -1] = 0.0
+        B[2, 0] = self.Bz_obs
+        J[2, 0] = self._bottom_jz_bc()
+
+    def _build_stable_cfcf_initial_state(self):
+        """Project an ordinary Stable-NFPT CFCF field into NFGS scalar space.
+
+        The actual field/current projection errors and the discarded Bc_z
+        zero mode are measured.  The returned tensors are reconstructed from
+        the same scalars used by the next nonlinear iteration, so there is no
+        hidden first-step state jump.
+        """
+        if self._stable_cfcf_boundary is None or self.B_background is None:
+            raise RuntimeError("NFGS boundary is not configured")
+        stable = StableNFPTSolverGPU(
+            *self._stable_cfcf_ctor_args, **self._stable_cfcf_ctor_kwargs
+        )
+        stable.set_bottom_vector_boundary(**self._stable_cfcf_boundary)
+        B, J, _phi, Az, _bc = stable.compute_initial_conditions(
+            init_mode="curl_free_current"
+        )
+        expected_shape = (3, self.Nz, self.Ny, self.Nx)
+        if tuple(B.shape) != expected_shape:
+            raise RuntimeError(
+                "Stable CFCF calculation grid does not match NFGS: "
+                f"stable={tuple(B.shape)}, nfgs={expected_shape}"
+            )
+        Bc_z = B[2] - self.B_background[2]
+        bc_mean_by_height = self._constant_mode_values_by_height(self._dct2(Bc_z))
+        Phi_c = self._solve_poisson_2d_skip_bottom(
+            Bc_z, "neumann", self.Phi_above_bottom
+        )
+        Bc_z_projected = self._lap_xy(Phi_c)
+        B_projected, J_projected, B_c_projected = (
+            self._reconstruct_state_from_scalars(Phi_c, Az, Bc_z_projected)
+        )
+
+        field_error = torch.sqrt(torch.mean((B_projected - B) ** 2))
+        current_error = torch.sqrt(torch.mean((J_projected - J) ** 2))
+        field_scale = torch.clamp(torch.sqrt(torch.mean(B**2)), min=1.0e-30)
+        current_scale = torch.clamp(torch.sqrt(torch.mean(J**2)), min=1.0e-30)
+        field_relative = float((field_error / field_scale).item())
+        current_relative = float((current_error / current_scale).item())
+        projection_error = max(field_relative, current_relative)
+        if (
+            self.handoff_projection_policy == "error"
+            and projection_error > self.handoff_projection_tolerance
+        ):
+            raise ValueError(
+                "Stable CFCF handoff is outside the NFGS representable subspace: "
+                f"field_relative={field_relative:.6e}, "
+                f"current_relative={current_relative:.6e}, "
+                f"tolerance={self.handoff_projection_tolerance:.6e}."
+            )
+
+        self._last_Bc_z = Bc_z_projected
+        self._init_diagnostics = {
+            "init_mode": "cfcf",
+            "mfr_count": 0,
+            "stable_cfcf_handoff": True,
+            "stable_cfcf_handoff_projected": True,
+            "stable_cfcf_field_rms_difference": float(field_error.item()),
+            "stable_cfcf_current_rms_difference": float(current_error.item()),
+            "stable_cfcf_field_relative_difference": field_relative,
+            "stable_cfcf_current_relative_difference": current_relative,
+            "stable_cfcf_mean_bcz_by_height": [
+                float(v.item()) for v in bc_mean_by_height
+            ],
+            "gaussian_separation": self.gaussian_separation_diagnostics,
+            "coupled_k0": self._k0_diagnostics,
+        }
+        return B_projected, J_projected, Phi_c, Az, B_c_projected
+
+    # ------------------------------------------------------------------
+    # Boundary-exact soft generalization of the Yi curl(J)=0 initializer
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _soft_affine_sum(terms, template: torch.Tensor):
+        """Combine batched sparse affine expressions.
+
+        An expression is ``(coefficients, constant)`` where coefficients maps
+        a one-dimensional unknown index to a tensor over the modal batch.
+        """
+        coefficients: dict[int, torch.Tensor] = {}
+        constant = torch.zeros_like(template)
+        for scale, expression in terms:
+            expr_coefficients, expr_constant = expression
+            scale_tensor = torch.as_tensor(
+                scale, device=template.device, dtype=template.dtype
+            )
+            if scale_tensor.ndim == 0:
+                scale_tensor = scale_tensor.expand_as(template)
+            constant = constant + scale_tensor * expr_constant
+            for index, coefficient in expr_coefficients.items():
+                value = scale_tensor * coefficient
+                coefficients[index] = coefficients.get(index, 0.0) + value
+        return coefficients, constant
+
+    def _soft_first_derivative_affine(self, field, template: torch.Tensor):
+        """Second-order first derivative of an affine z profile."""
+        count = len(field)
+        if count < 3:
+            raise ValueError("second-order affine derivative requires 3 z planes")
+        inv_2dz = 1.0 / (2.0 * float(self.dz))
+        derivative = [None] * count
+        derivative[0] = self._soft_affine_sum(
+            [
+                (-3.0 * inv_2dz, field[0]),
+                (4.0 * inv_2dz, field[1]),
+                (-inv_2dz, field[2]),
+            ],
+            template,
+        )
+        for iz in range(1, count - 1):
+            derivative[iz] = self._soft_affine_sum(
+                [(-inv_2dz, field[iz - 1]), (inv_2dz, field[iz + 1])],
+                template,
+            )
+        derivative[-1] = self._soft_affine_sum(
+            [
+                (3.0 * inv_2dz, field[-1]),
+                (-4.0 * inv_2dz, field[-2]),
+                (inv_2dz, field[-3]),
+            ],
+            template,
+        )
+        return derivative
+
+    def _soft_second_derivative_affine(self, field, template: torch.Tensor):
+        """Second-order second derivative of an affine z profile."""
+        count = len(field)
+        if count < 4:
+            raise ValueError("second-order affine curvature requires 4 z planes")
+        inv_dz2 = 1.0 / (float(self.dz) ** 2)
+        derivative = [None] * count
+        derivative[0] = self._soft_affine_sum(
+            [
+                (2.0 * inv_dz2, field[0]),
+                (-5.0 * inv_dz2, field[1]),
+                (4.0 * inv_dz2, field[2]),
+                (-inv_dz2, field[3]),
+            ],
+            template,
+        )
+        for iz in range(1, count - 1):
+            derivative[iz] = self._soft_affine_sum(
+                [
+                    (inv_dz2, field[iz - 1]),
+                    (-2.0 * inv_dz2, field[iz]),
+                    (inv_dz2, field[iz + 1]),
+                ],
+                template,
+            )
+        derivative[-1] = self._soft_affine_sum(
+            [
+                (2.0 * inv_dz2, field[-1]),
+                (-5.0 * inv_dz2, field[-2]),
+                (4.0 * inv_dz2, field[-3]),
+                (-inv_dz2, field[-4]),
+            ],
+            template,
+        )
+        return derivative
+
+    def _soft_constrained_profile(self, k: torch.Tensor, bottom: torch.Tensor, kind: str):
+        """Return a sparse affine profile satisfying all essential BCs."""
+        batch = k.numel()
+        zero = torch.zeros(batch, device=k.device, dtype=k.dtype)
+        one = torch.ones_like(zero)
+        denom = 3.0 + 2.0 * float(self.dz) * k
+
+        if kind == "phi":
+            # Unknowns are p_2,...,p_{N-1}.  p_1 enforces
+            # (-3 p_0 + 4 p_1 - p_2)/(2 dz) = k p_0 exactly.
+            n_unknown = self.Nz - 3
+            field = [None] * self.Nz
+            field[0] = ({}, bottom)
+            field[1] = (
+                {0: 0.25 * one},
+                (0.75 + 0.5 * float(self.dz) * k) * bottom,
+            )
+            for iz in range(2, self.Nz - 1):
+                field[iz] = ({iz - 2: one}, zero)
+        elif kind == "az":
+            # Unknowns are a_1,...,a_{N-1}; a_0 is the observed toroidal map.
+            n_unknown = self.Nz - 2
+            field = [None] * self.Nz
+            field[0] = ({}, bottom)
+            for iz in range(1, self.Nz - 1):
+                field[iz] = ({iz - 1: one}, zero)
+        else:
+            raise ValueError("kind must be 'phi' or 'az'")
+
+        # (3 u_N - 4 u_{N-1} + u_{N-2})/(2 dz) + k u_N = 0.
+        field[-1] = self._soft_affine_sum(
+            [(4.0 / denom, field[-2]), (-1.0 / denom, field[-3])],
+            zero,
+        )
+        return field, n_unknown
+
+    @staticmethod
+    def _soft_banded_cholesky_solve(
+        lower: torch.Tensor, rhs: torch.Tensor
+    ) -> torch.Tensor:
+        """Solve a symmetric positive-definite batched band system.
+
+        ``lower[d, b, i]`` stores ``H[b, i, i-d]``.  The implementation is
+        O(batch * bandwidth**2 * Nz), avoiding dense O(Nz**3) modal solves.
+        """
+        bandwidth = lower.shape[0] - 1
+        batch, size = rhs.shape
+        factor = lower.clone()
+        scale = torch.clamp(lower[0].abs().amax(dim=-1), min=1.0)
+        floor = torch.finfo(lower.dtype).eps * scale
+
+        for i in range(size):
+            diagonal = lower[0, :, i].clone()
+            for offset in range(1, min(bandwidth, i) + 1):
+                diagonal -= factor[offset, :, i] ** 2
+            factor[0, :, i] = torch.sqrt(torch.clamp(diagonal, min=floor))
+
+            for row in range(i + 1, min(size, i + bandwidth + 1)):
+                value = lower[row - i, :, row].clone()
+                first = max(0, i - bandwidth, row - bandwidth)
+                for column in range(first, i):
+                    value -= (
+                        factor[row - column, :, row]
+                        * factor[i - column, :, i]
+                    )
+                factor[row - i, :, row] = value / factor[0, :, i]
+
+        y = torch.empty_like(rhs)
+        for i in range(size):
+            value = rhs[:, i].clone()
+            for offset in range(1, min(bandwidth, i) + 1):
+                value -= factor[offset, :, i] * y[:, i - offset]
+            y[:, i] = value / factor[0, :, i]
+
+        solution = torch.empty_like(rhs)
+        for i in range(size - 1, -1, -1):
+            value = y[:, i].clone()
+            for row in range(i + 1, min(size, i + bandwidth + 1)):
+                value -= factor[row - i, :, row] * solution[:, row]
+            solution[:, i] = value / factor[0, :, i]
+        return solution
+
+    def _solve_soft_cfcf_mode_batch(
+        self, k_input: torch.Tensor, bottom_input: torch.Tensor, *, kind: str
+    ) -> torch.Tensor:
+        """Minimize the modal quadratic for one batch of horizontal modes."""
+        work_dtype = torch.float64
+        k = k_input.to(dtype=work_dtype)
+        bottom = bottom_input.to(dtype=work_dtype)
+        template = torch.zeros_like(k)
+        field, n_unknown = self._soft_constrained_profile(k, bottom, kind)
+        d2_field = self._soft_second_derivative_affine(field, template)
+        k2 = k * k
+        lap_field = [
+            self._soft_affine_sum(
+                [(1.0, d2_field[iz]), (-k2, field[iz])], template
+            )
+            for iz in range(self.Nz)
+        ]
+        # The volume functional has no boundary measure.  Use the interior
+        # L_k values only; this also preserves the exact eps=0 reduction when
+        # a boundary-compatible discrete curl(J)=0 profile exists.
+        lap_interior = lap_field[1:-1]
+        z_weight = torch.ones(self.Nz - 2, device=k.device, dtype=work_dtype)
+        rows = []
+        epsilon = float(self.soft_cfcf_epsilon)
+
+        if kind == "phi":
+            d_lap = self._soft_first_derivative_affine(lap_interior, template)
+            for iz in range(self.Nz - 2):
+                rows.append((d_lap[iz], z_weight[iz]))
+                rows.append((lap_interior[iz], z_weight[iz] * (k2 + epsilon)))
+        else:
+            d_field = self._soft_first_derivative_affine(field, template)
+            for iz in range(1, self.Nz - 1):
+                weight = z_weight[iz - 1]
+                rows.append((lap_field[iz], weight))
+                if epsilon > 0.0:
+                    rows.append((d_field[iz], weight * epsilon))
+                    rows.append((field[iz], weight * epsilon * k2))
+
+        bandwidth = 0
+        for (coefficients, _constant), _weight in rows:
+            if coefficients:
+                indices = coefficients.keys()
+                bandwidth = max(bandwidth, max(indices) - min(indices))
+        lower = torch.zeros(
+            (bandwidth + 1, k.numel(), n_unknown),
+            device=k.device,
+            dtype=work_dtype,
+        )
+        gradient = torch.zeros(
+            (k.numel(), n_unknown), device=k.device, dtype=work_dtype
+        )
+
+        for (coefficients, constant), weight in rows:
+            items = sorted(coefficients.items())
+            for index_i, coefficient_i in items:
+                gradient[:, index_i] += weight * coefficient_i * constant
+                for index_j, coefficient_j in items:
+                    if index_i < index_j:
+                        continue
+                    lower[index_i - index_j, :, index_i] += (
+                        weight * coefficient_i * coefficient_j
+                    )
+
+        diagonal_scale = torch.clamp(lower[0].abs().amax(dim=-1), min=1.0)
+        lower[0] += (
+            self.soft_cfcf_normal_ridge * diagonal_scale[:, None]
+        )
+        unknown = self._soft_banded_cholesky_solve(lower, -gradient)
+        if not bool(torch.isfinite(unknown).all().item()):
+            raise RuntimeError("soft_cfcf modal normal solve produced non-finite values")
+
+        profile = torch.empty(
+            (k.numel(), self.Nz), device=k.device, dtype=work_dtype
+        )
+        for iz, (coefficients, constant) in enumerate(field):
+            value = constant.clone()
+            for index, coefficient in coefficients.items():
+                value += coefficient * unknown[:, index]
+            profile[:, iz] = value
+        return profile.to(dtype=self.dtype)
+
+    def _solve_soft_cfcf_modes(
+        self, k: torch.Tensor, bottom_hat: torch.Tensor, *, kind: str
+    ) -> torch.Tensor:
+        """Solve all nonzero modes in bounded-memory batches."""
+        flat_k = k.reshape(-1)
+        flat_bottom = bottom_hat.reshape(-1)
+        active = torch.nonzero(flat_k > 0.0, as_tuple=False).reshape(-1)
+        result = torch.zeros(
+            (self.Nz, flat_k.numel()), device=self.device, dtype=self.dtype
+        )
+        batch_size = self.soft_cfcf_mode_batch_size
+        for start in range(0, active.numel(), batch_size):
+            indices = active[start : start + batch_size]
+            profiles = self._solve_soft_cfcf_mode_batch(
+                flat_k[indices], flat_bottom[indices], kind=kind
+            )
+            result[:, indices] = profiles.transpose(0, 1)
+        return result.reshape((self.Nz,) + tuple(k.shape))
+
+    def _soft_cfcf_initial_state(self):
+        """Solve Eq. (20) in the PT modal basis.
+
+        For a horizontal mode with wavenumber ``k`` and
+        ``L_k = d_zz - k**2``, the functional separates into
+
+        ``Phi``: ``|d_z L_k Phi|^2 + (k^2 + eps)|L_k Phi|^2``
+
+        ``Az``: ``|L_k Az|^2 + eps(|d_z Az|^2 + k^2|Az|^2)``.
+
+        These are precisely the modal contributions to
+        ``int |curl J_c|^2 + eps int |J_c|^2`` (a common positive ``k^2``
+        factor is omitted).  The bottom data and transparent top Robin rows
+        are eliminated algebraically, so they remain exact constraints rather
+        than penalty terms.
+        """
+        if self.Nz < 5:
+            raise ValueError("soft_cfcf requires Nz >= 5")
+        if self.Nx < 3 or self.Ny < 3:
+            raise ValueError("soft_cfcf requires Nx, Ny >= 3")
+
+        phi_bottom_hat = self._dct2(self.Phi_above_bottom)
+        phi_bottom_hat[0, 0] = 0.0
+        phi_hat = self._solve_soft_cfcf_modes(
+            self._nfgs_k, phi_bottom_hat, kind="phi"
+        )
+        Phi_c = self._idct2(phi_hat)
+        Phi_c[0] = self.Phi_above_bottom
+
+        az_bottom_hat = self._dst1(
+            self._dst1(self.Az_bottom[1:-1, 1:-1], -1), -2
+        )
+        az_k = torch.sqrt(torch.clamp(-self._dirichlet_lam_xy_interior(), min=0.0))
+        az_hat = self._solve_soft_cfcf_modes(az_k, az_bottom_hat, kind="az")
+        modal_energies = self._soft_cfcf_modal_energies(
+            phi_hat, az_hat, az_k
+        )
+        Az = torch.zeros(
+            (self.Nz, self.Ny, self.Nx), device=self.device, dtype=self.dtype
+        )
+        Az[:, 1:-1, 1:-1] = self._idst1(self._idst1(az_hat, -1), -2)
+        Az[0] = self.Az_bottom
+        if self._lateral_wall == "BC1":
+            self._enforce_lateral_az_dirichlet_zero(Az)
+
+        Bc_z = self._lap_xy(Phi_c)
+        B, J, B_c = self._reconstruct_state_from_scalars(Phi_c, Az, Bc_z)
+        self._last_Bc_z = Bc_z
+        diagnostics = self._soft_cfcf_diagnostics(
+            B, J, Phi_c, Az, B_c, modal_energies
+        )
+        self._init_diagnostics = {
+            "init_mode": "soft_cfcf",
+            "mfr_count": 0,
+            "soft_cfcf_epsilon": self.soft_cfcf_epsilon,
+            "soft_cfcf_mode_batch_size": self.soft_cfcf_mode_batch_size,
+            "soft_cfcf_normal_ridge": self.soft_cfcf_normal_ridge,
+            "soft_cfcf": diagnostics,
+            "gaussian_separation": self.gaussian_separation_diagnostics,
+            "coupled_k0": self._k0_diagnostics,
+        }
+        return B, J, Phi_c, Az, B_c
+
+    def _soft_cfcf_modal_energies(self, phi_hat, az_hat, az_k) -> dict:
+        """Evaluate the same modal quadrature minimized by the linear solve."""
+        work_dtype = torch.float64
+        dz = float(self.dz)
+        phi = phi_hat.to(dtype=work_dtype)
+        k_phi = self._nfgs_k.to(dtype=work_dtype)
+        q_phi = (
+            (phi[2:] - 2.0 * phi[1:-1] + phi[:-2]) / (dz * dz)
+            - k_phi.square()[None] * phi[1:-1]
+        )
+        dq_phi = torch.empty_like(q_phi)
+        dq_phi[0] = (-3.0 * q_phi[0] + 4.0 * q_phi[1] - q_phi[2]) / (
+            2.0 * dz
+        )
+        dq_phi[1:-1] = (q_phi[2:] - q_phi[:-2]) / (2.0 * dz)
+        dq_phi[-1] = (
+            3.0 * q_phi[-1] - 4.0 * q_phi[-2] + q_phi[-3]
+        ) / (2.0 * dz)
+        phi_current_by_mode = k_phi.square() * q_phi.square().sum(dim=0)
+        phi_curl_by_mode = k_phi.square() * (
+            dq_phi.square() + k_phi.square()[None] * q_phi.square()
+        ).sum(dim=0)
+
+        az = az_hat.to(dtype=work_dtype)
+        k_az = az_k.to(dtype=work_dtype)
+        q_az = (
+            (az[2:] - 2.0 * az[1:-1] + az[:-2]) / (dz * dz)
+            - k_az.square()[None] * az[1:-1]
+        )
+        daz = (az[2:] - az[:-2]) / (2.0 * dz)
+        az_current_by_mode = k_az.square() * (
+            daz.square() + k_az.square()[None] * az[1:-1].square()
+        ).sum(dim=0)
+        az_curl_by_mode = k_az.square() * q_az.square().sum(dim=0)
+
+        # Parseval factors for the unnormalized DCT-I / DST-I helpers.  The
+        # DCT endpoint modes carry half weight; all DST interior modes carry
+        # unit weight.  Both transforms share the same 2-D normalization.
+        wx = torch.ones(self.Nx, device=self.device, dtype=work_dtype)
+        wy = torch.ones(self.Ny, device=self.device, dtype=work_dtype)
+        wx[[0, -1]] = 0.5
+        wy[[0, -1]] = 0.5
+        dct_weight = wy[:, None] * wx[None, :]
+        normalization = 4.0 * (self.Nx - 1) * (self.Ny - 1)
+        factor = float(self.dx) * float(self.dy) * dz / normalization
+        curl_energy = factor * (
+            (dct_weight * phi_curl_by_mode).sum() + az_curl_by_mode.sum()
+        )
+        current_energy = factor * (
+            (dct_weight * phi_current_by_mode).sum() + az_current_by_mode.sum()
+        )
+        return {
+            "curl_current_energy": float(curl_energy.item()),
+            "current_energy": float(current_energy.item()),
+        }
+
+    def _soft_cfcf_diagnostics(
+        self, B, J, Phi_c, Az, B_c, modal_energies: dict
+    ) -> dict:
+        """Measure Eq. (20), its exact constraints, and bottom fidelity."""
+        curl_j = torch.stack(
+            [
+                self._d_dy_centered(J[2]) - self._d_dz_centered(J[1]),
+                self._d_dz_centered(J[0]) - self._d_dx_centered(J[2]),
+                self._d_dx_centered(J[1]) - self._d_dy_centered(J[0]),
+            ]
+        )
+        cell_volume = float(self.dx) * float(self.dy) * float(self.dz)
+        reconstructed_curl_energy = float(
+            (curl_j.double().square().sum() * cell_volume).item()
+        )
+        reconstructed_current_energy = float(
+            (J.double().square().sum() * cell_volume).item()
+        )
+
+        phi_bottom_hat = self._dct2(self.Phi_above_bottom)
+        phi_derivative_target = self._idct2(self._nfgs_k * phi_bottom_hat)
+        phi_derivative = self._d_dz_centered(Phi_c)[0]
+        phi_hat = self._dct2(Phi_c)
+        phi_top_derivative_hat = (
+            3.0 * phi_hat[-1] - 4.0 * phi_hat[-2] + phi_hat[-3]
+        ) / (2.0 * float(self.dz))
+        phi_top_robin = self._idct2(
+            phi_top_derivative_hat + self._nfgs_k * phi_hat[-1]
+        )
+
+        az_hat = self._dst1(self._dst1(Az[:, 1:-1, 1:-1], -1), -2)
+        az_k = torch.sqrt(torch.clamp(-self._dirichlet_lam_xy_interior(), min=0.0))
+        az_top_derivative_hat = (
+            3.0 * az_hat[-1] - 4.0 * az_hat[-2] + az_hat[-3]
+        ) / (2.0 * float(self.dz))
+        az_top_robin = self._idst1(
+            self._idst1(az_top_derivative_hat + az_k * az_hat[-1], -1), -2
+        )
+
+        expected_bcx = -self._d_dx_2d(phi_derivative_target) + self._d_dy_2d(
+            self.Az_bottom
+        )
+        expected_bcy = -self._d_dy_2d(phi_derivative_target) - self._d_dx_2d(
+            self.Az_bottom
+        )
+        expected_bh = torch.stack([expected_bcx, expected_bcy])
+
+        def rms(value: torch.Tensor) -> float:
+            return float(torch.sqrt(torch.mean(value.double() ** 2)).item())
+
+        return {
+            **modal_energies,
+            "objective": (
+                modal_energies["curl_current_energy"]
+                + self.soft_cfcf_epsilon * modal_energies["current_energy"]
+            ),
+            "reconstructed_curl_current_energy": reconstructed_curl_energy,
+            "reconstructed_current_energy": reconstructed_current_energy,
+            "bottom_phi_rms": rms(Phi_c[0] - self.Phi_above_bottom),
+            "bottom_dphi_rms": rms(phi_derivative - phi_derivative_target),
+            "bottom_az_rms": rms(Az[0] - self.Az_bottom),
+            "bottom_bz_rms": rms(B[2, 0] - self.Bz_obs),
+            "bottom_jz_rms": rms(J[2, 0] - self._bottom_jz_bc()),
+            "bottom_bh_current_carrying_rms": rms(B_c[:2, 0] - expected_bh),
+            "bottom_bh_observation_rms": rms(
+                B[:2, 0] - torch.stack([self.Bx_obs, self.By_obs])
+            ),
+            "top_phi_transparent_rms": rms(phi_top_robin),
+            "top_az_transparent_rms": rms(az_top_robin),
+        }
+
+    def compute_initial_conditions(self, *, init_mode="gs_cfcf", **_unused):
+        mode = str(init_mode).lower().replace("-", "_")
+        if mode == "yi_soft":
+            mode = "soft_cfcf"
+        if mode not in ("gs_cfcf", "cfcf", "curl_free_current", "soft_cfcf"):
+            raise ValueError(
+                "NFGS supports init_mode='gs_cfcf', 'cfcf', or 'soft_cfcf'"
+            )
+        if self.B_background is None or self.Bz_above is None:
+            raise RuntimeError(
+                "NFGS boundary is not set. Call set_bottom_vector_boundary() first."
+            )
+        if mode in ("cfcf", "curl_free_current"):
+            return self._build_stable_cfcf_initial_state()
+        if mode == "soft_cfcf":
+            return self._soft_cfcf_initial_state()
+
+        zeros = torch.zeros(
+            (self.Nz, self.Ny, self.Nx), device=self.device, dtype=self.dtype
+        )
+        Phi_c = self._solve_phi_c_update(zeros, self.Phi_above_bottom)
+        Phi_c = self._apply_bottom_divergence_projection(Phi_c)
+        Bc_z = self._lap_xy(Phi_c)
+        Az = self._solve_az_from_jz_poisson_source(zeros)
+        B, J, B_c = self._reconstruct_state_from_scalars(Phi_c, Az, Bc_z)
+        self._last_Bc_z = Bc_z
+        self._init_diagnostics = {
+            "init_mode": "gs_cfcf",
+            "mfr_count": 0,
+            "gaussian_separation": self.gaussian_separation_diagnostics,
+            "coupled_k0": self._k0_diagnostics,
+        }
+        return B, J, Phi_c, Az, B_c
+
+    def iteration_step(
+        self,
+        B,
+        J,
+        Phi_c,
+        Az,
+        B_c,
+        mu=1.0,
+        polarity_mask: str = "both",
+    ):
+        if self.Bz_above is None or self.Phi_above_bottom is None:
+            raise RuntimeError("NFGS boundary is not configured")
+
+        diagnostics_enabled = self.record_iteration_diagnostics
+        h_k0_before = self._H_k0.clone() if diagnostics_enabled and self._H_k0 is not None else None
+        clip_fraction = 0.0
+        weak_field_fraction = 0.0
+        if diagnostics_enabled:
+            if self.vertical_current_operator == "staggered_face":
+                diagnostic_B, diagnostic_J = self._vertical_staggered_face_state(
+                    B, J[2]
+                )
+            else:
+                diagnostic_B, diagnostic_J = B, J
+            b2_raw = torch.sum(diagnostic_B * diagnostic_B, dim=0)
+            weak_field_fraction = float(
+                torch.mean((b2_raw <= self.weak_field_floor_b2).double()).item()
+            )
+            alpha_raw = torch.sum(diagnostic_J * diagnostic_B, dim=0) / torch.clamp(
+                b2_raw, min=self.weak_field_floor_b2
+            )
+            alpha_max = self.alpha_max()
+            if alpha_max is not None:
+                clip_fraction = float(
+                    torch.mean((alpha_raw.abs() > float(alpha_max)).double()).item()
+                )
+
+        if self.horizontal_zero_mode_policy in {
+            "coupled_k0",
+            "constrained_spline_harmonic",
+        }:
+            # Recover the mode from the passed state so safeguarded rollback
+            # states remain complete even though the base driver stores five
+            # tensors only.
+            residual = B[:2] - self.B_background[:2] - B_c[:2]
+            self._H_k0 = residual.mean(dim=(-2, -1))
+            self._H_k0[:, 0] = self._H_k0_bottom_target
+
+        J_para = self.compute_parallel_currents(J, B)
+        if polarity_mask == "positive":
+            mask = (self.Bz_obs > 0).to(self.dtype)
+            J_para[:, 0] = J[:, 0] * mask
+        elif polarity_mask == "negative":
+            mask = (self.Bz_obs < 0).to(self.dtype)
+            J_para[:, 0] = J[:, 0] * mask
+        elif polarity_mask == "both":
+            if self._bottom_jperp_zero:
+                if self.bottom_parallel_current_mode == "face_parallel_exact_jz":
+                    # Keep the face-aligned parallel horizontal current already
+                    # projected to the first solver plane; overwrite only Jz with
+                    # the exact bottom boundary value.
+                    J_para[2, 0] = self._bottom_jz_bc()
+                else:
+                    J_para[:, 0] = J[:, 0]
+        else:
+            raise ValueError("polarity_mask must be 'positive', 'negative', or 'both'")
+
+        if self.buffer_window is not None:
+            J_para = J_para * self.buffer_window
+
+        J_para_k0 = self._k0_parallel_current_target(J_para, B, J[2])
+        if (
+            self.buffer_window is not None
+            and self.k0_current_target_placement == "face"
+            and self.vertical_current_operator == "staggered_face"
+        ):
+            # Face rebuild ignores the already-buffered cell field.
+            J_para_k0 = J_para_k0 * self.buffer_window
+
+        source_Bc_z = self._d_dy_centered(J_para[0]) - self._d_dx_centered(J_para[1])
+        Phi_c_star = self._solve_phi_c_update(source_Bc_z, self.Phi_above_bottom)
+        Bc_z_star = self._lap_xy(Phi_c_star)
+
+        if self._rhs_lap_xy == "spectral":
+            lap_xy_Jpz = self._lap_xy_spectral(
+                J_para[2], bc=self._rhs_lap_xy_spectral_ext
+            )
+        else:
+            lap_xy_Jpz = self._lap_xy(J_para[2])
+
+        if self._rhs_jz_div_chain:
+            div_xy_Jp = self._d_dx_centered(J_para[0]) + self._d_dy_centered(J_para[1])
+            source_Jz = lap_xy_Jpz - self._d_dz_centered(div_xy_Jp)
+        else:
+            source_Jz = (
+                lap_xy_Jpz
+                - self._d2_dxdz(J_para[0])
+                - self._d2_dydz(J_para[1])
+            )
+
+        if self._toroidal_boundary:
+            Az_star = self._solve_az_from_jz_poisson_source(source_Jz)
+        else:
+            raise ValueError("NFGS v1 requires toroidal_boundary=True")
+
+        Phi_c_star[0] = self.Phi_above_bottom
+        Phi_c_star = self._apply_bottom_divergence_projection(Phi_c_star)
+        Bc_z_star = self._lap_xy(Phi_c_star)
+        Az_star[0] = self.Az_bottom
+        Az_star[-1] = 0.0
+        if self._lateral_wall == "BC1":
+            self._enforce_lateral_az_dirichlet_zero(Az_star)
+
+        H_k0_star = None
+        if self.horizontal_zero_mode_policy in {
+            "coupled_k0",
+            "constrained_spline_harmonic",
+        }:
+            _B_pt_star, J_pt_star, _B_c_pt_star = (
+                self._reconstruct_pt_state_from_scalars(
+                    Phi_c_star, Az_star, Bc_z_star
+                )
+            )
+            if self.horizontal_zero_mode_policy == "coupled_k0":
+                H_k0_star = self._update_coupled_k0(J_para_k0, J_pt_star)
+            else:
+                H_k0_star = self._update_constrained_spline_harmonic(
+                    J_para_k0, J_pt_star
+                )
+
+        mu_k0 = float(self.k0_update_mu) if self.k0_update_mu is not None else float(mu)
+        if self._relax_scalars and mu < 1.0:
+            Phi_c_new = mu * Phi_c_star + (1.0 - mu) * Phi_c
+            Az_new = mu * Az_star + (1.0 - mu) * Az
+        else:
+            Phi_c_new, Az_new = Phi_c_star, Az_star
+        if H_k0_star is not None:
+            if self._H_k0 is not None and mu_k0 < 1.0:
+                self._H_k0 = mu_k0 * H_k0_star + (1.0 - mu_k0) * self._H_k0
+            else:
+                self._H_k0 = H_k0_star
+
+        Phi_c_new[0] = self.Phi_above_bottom
+        Bc_z_new = self._lap_xy(Phi_c_new)
+        Az_new[0] = self.Az_bottom
+        Az_new[-1] = 0.0
+        if self._lateral_wall == "BC1":
+            self._enforce_lateral_az_dirichlet_zero(Az_new)
+
+        B_new, J_new, B_c_new = self._reconstruct_state_from_scalars(
+            Phi_c_new, Az_new, Bc_z_new
+        )
+        self._last_Bc_z = Bc_z_new
+
+        if not self._relax_scalars and mu < 1.0:
+            B_c_new = mu * B_c_new + (1.0 - mu) * B_c
+            J_new = mu * J_new + (1.0 - mu) * J
+            B_new = self.B_background + B_c_new
+            self._apply_boundary_conditions(B_new, J_new)
+
+        if diagnostics_enabled:
+            def relative_rms(delta: torch.Tensor, scale: torch.Tensor) -> float:
+                numerator = torch.sqrt(torch.mean(delta.double() ** 2))
+                denominator = torch.clamp(
+                    torch.sqrt(torch.mean(scale.double() ** 2)), min=1.0e-30
+                )
+                return float((numerator / denominator).item())
+
+            bcz_residual = (
+                self._d2dz2(Bc_z_star) + self._lap_xy(Bc_z_star) - source_Bc_z
+            )
+            jz_star = -self._lap_xy(Az_star)
+            jz_residual = (
+                self._d2dz2(jz_star) + self._lap_xy(jz_star) - source_Jz
+            )
+            bcz_interior = slice(2, -1) if self.Nz > 4 else slice(1, -1)
+            jz_interior = slice(1, -1)
+
+            lam_neumann = self._endpoint_neumann_lam_xy().to(
+                dtype=source_Bc_z.dtype
+            )
+            lam_neumann_safe = lam_neumann.clone()
+            lam_neumann_safe[0, 0] = 1.0
+            source_phi_hat = self._dct2(source_Bc_z) / lam_neumann_safe[None]
+            source_phi_hat[:, 0, 0] = 0.0
+            source_phi = self._idct2(source_phi_hat)
+            phi_scalar_residual = (
+                self._d2dz2(Phi_c_star) + self._lap_xy(Phi_c_star) - source_phi
+            )
+
+            source_az_rhs = torch.zeros_like(Az_star)
+            source_jz_hat = self._dst1(
+                self._dst1(source_Jz[:, 1:-1, 1:-1], -1), -2
+            )
+            lam_dirichlet = self._dirichlet_lam_xy_interior().to(
+                dtype=source_jz_hat.dtype
+            )
+            source_az_hat = -source_jz_hat / lam_dirichlet[None]
+            source_az_rhs[:, 1:-1, 1:-1] = self._idst1(
+                self._idst1(source_az_hat, -1), -2
+            )
+            az_scalar_residual = (
+                self._d2dz2(Az_star) + self._lap_xy(Az_star) - source_az_rhs
+            )
+
+            rho = float(self.bottom_divergence_robin_weight)
+            dphi_bottom = (
+                -3.0 * Phi_c_star[0]
+                + 4.0 * Phi_c_star[1]
+                - Phi_c_star[2]
+            ) / (2.0 * float(self.dz))
+            dphi_target = (
+                self._bottom_dphi_c_target
+                if self._bottom_dphi_c_target is not None
+                else torch.zeros_like(dphi_bottom)
+            )
+            mixed_pde_term = (1.0 - rho) * phi_scalar_residual[1]
+            mixed_derivative_term = -rho * (
+                dphi_bottom - dphi_target
+            ) / float(self.dz)
+            mixed_residual = mixed_pde_term + mixed_derivative_term
+
+            def relative_operator_rms(
+                residual: torch.Tensor, *terms: torch.Tensor
+            ) -> float:
+                numerator = torch.sqrt(torch.mean(residual.double() ** 2))
+                scales = [
+                    torch.sqrt(torch.mean(term.double() ** 2)) for term in terms
+                ]
+                denominator = torch.clamp(torch.stack(scales).max(), min=1.0e-30)
+                return float((numerator / denominator).item())
+            bottom_observed = torch.stack(
+                [self.Bx_obs, self.By_obs, self.Bz_obs]
+            )
+            bottom_field_error = B_new[:, 0] - bottom_observed
+            bottom_jz_error = J_new[2, 0] - self._bottom_jz_bc()
+            h_k0_update = 0.0
+            if h_k0_before is not None and self._H_k0 is not None:
+                h_k0_update = relative_rms(self._H_k0 - h_k0_before, h_k0_before)
+            diagnostics = {
+                    "phi_update_relative": relative_rms(Phi_c_new - Phi_c, Phi_c),
+                    "az_update_relative": relative_rms(Az_new - Az, Az),
+                    "phi_map_residual_relative": relative_rms(
+                        Phi_c_star - Phi_c, Phi_c
+                    ),
+                    "az_map_residual_relative": relative_rms(Az_star - Az, Az),
+                    "h_k0_update_relative": h_k0_update,
+                    "h_k0_map_residual_relative": (
+                        relative_rms(H_k0_star - h_k0_before, h_k0_before)
+                        if H_k0_star is not None and h_k0_before is not None
+                        else 0.0
+                    ),
+                    "bcz_pde_residual_relative": relative_rms(
+                        bcz_residual[bcz_interior], source_Bc_z[bcz_interior]
+                    ),
+                    "jz_pde_residual_relative": relative_rms(
+                        jz_residual[jz_interior], source_Jz[jz_interior]
+                    ),
+                    "poloidal_pde_residual_relative": relative_operator_rms(
+                        phi_scalar_residual[bcz_interior],
+                        self._d2dz2(Phi_c_star)[bcz_interior],
+                        self._lap_xy(Phi_c_star)[bcz_interior],
+                        source_phi[bcz_interior],
+                    ),
+                    "toroidal_pde_residual_relative": relative_operator_rms(
+                        az_scalar_residual[1:-1, 1:-1, 1:-1],
+                        self._d2dz2(Az_star)[1:-1, 1:-1, 1:-1],
+                        self._lap_xy(Az_star)[1:-1, 1:-1, 1:-1],
+                        source_az_rhs[1:-1, 1:-1, 1:-1],
+                    ),
+                    "mixed_row_residual_relative": relative_operator_rms(
+                        mixed_residual,
+                        mixed_pde_term,
+                        mixed_derivative_term,
+                        source_phi[1],
+                    ),
+                    "bottom_field_imprint_relative": relative_rms(
+                        bottom_field_error, bottom_observed
+                    ),
+                    "bottom_jz_imprint_relative": relative_rms(
+                        bottom_jz_error, self._bottom_jz_bc()
+                    ),
+                    "alpha_clip_fraction": clip_fraction,
+                    "weak_field_floor_fraction": weak_field_fraction,
+                }
+            self._last_iteration_diagnostics = diagnostics
+            self._iteration_diagnostics_history.append(diagnostics)
+
+        return B_new, J_new, Phi_c_new, Az_new, B_c_new
+
+    def iterate(self, *args, init_mode="gs_cfcf", **kwargs):
+        mode = str(init_mode).lower().replace("-", "_")
+        if mode == "yi_soft":
+            mode = "soft_cfcf"
+        if mode not in ("gs_cfcf", "cfcf", "curl_free_current", "soft_cfcf"):
+            raise ValueError(
+                "NFGS supports init_mode='gs_cfcf', 'cfcf', or 'soft_cfcf'"
+            )
+        if (
+            str(kwargs.get("stop_mode", "sigma_best")).lower().replace("-", "_")
+            == "fixed_point"
+            and not self.record_iteration_diagnostics
+        ):
+            raise ValueError(
+                "stop_mode='fixed_point' requires record_iteration_diagnostics=True"
+            )
+        self._iteration_diagnostics_history = []
+        self._last_iteration_diagnostics = {}
+        history = super().iterate(*args, init_mode=mode, **kwargs)
+        history["source_partition_mode"] = self.source_partition_mode
+        history["vertical_current_operator"] = self.vertical_current_operator
+        history["sigma_placement"] = (
+            "vertical_faces"
+            if self.vertical_current_operator == "staggered_face"
+            else "collocated_planes"
+        )
+        if self.record_iteration_diagnostics:
+            n_steps = len(history.get("sigma", []))
+            rows = self._iteration_diagnostics_history[:n_steps]
+            diagnostic_keys = (
+                sorted(rows[0]) if rows else []
+            )
+            for key in diagnostic_keys:
+                history[key] = [float(row[key]) for row in rows]
+            history["iteration_diagnostics_definition"] = {
+                "state": (
+                    "attempted candidate from the proposed nonlinear map; accepted "
+                    "versus rollback status is stored in history.rollback"
+                ),
+                "map_residual": (
+                    "unrelaxed nonlinear map T(x_n)-x_n divided by RMS state"
+                ),
+                "pde_scope": (
+                    "scalar poloidal/toroidal interior rows; mixed first-interior "
+                    "row is reported separately"
+                ),
+                "relative_norm": (
+                    "RMS residual divided by the largest RMS operator/source term"
+                ),
+                "weak_field_floor_B2": self.weak_field_floor_b2,
+                "alpha_clip_scale": self.alpha_clip_scale,
+            }
+        if (
+            self.horizontal_zero_mode_policy
+            in {"coupled_k0", "constrained_spline_harmonic"}
+            and self._B is not None
+            and self._Phi_c is not None
+            and self._Az is not None
+        ):
+            bcz_best = self._lap_xy(self._Phi_c)
+            B_pt_best, _J_pt_best, _B_c_best = (
+                self._reconstruct_pt_state_from_scalars(
+                    self._Phi_c, self._Az, bcz_best
+                )
+            )
+            self._H_k0 = (self._B[:2] - B_pt_best[:2]).mean(dim=(-2, -1))
+            self._H_k0[:, 0] = self._H_k0_bottom_target
+        if self.vertical_current_operator == "staggered_face" and self._B is not None:
+            best_jz = self._J[2] if self._J is not None else None
+            self._vertical_staggered_current_at_centres(self._B, best_jz)
+        history["source_diagnostics"] = self.compute_source_diagnostics()
+        return history
+
+    # ------------------------------------------------------------------
+    # Source-attribution diagnostics
+    # ------------------------------------------------------------------
+    def compute_source_diagnostics(self, B: Optional[torch.Tensor] = None) -> dict:
+        if self.Bz_above is None or self.Bz_below is None or self.B_mean is None:
+            raise RuntimeError("NFGS boundary is not configured")
+
+        if B is None:
+            B = self._B
+        if B is not None:
+            Bc_z = B[2] - self.B_background[2]
+        elif self._last_Bc_z is not None:
+            Bc_z = self._last_Bc_z
+        else:
+            zeros = torch.zeros(
+                (self.Nz, self.Ny, self.Nx), device=self.device, dtype=self.dtype
+            )
+            Bc_z = self._solve_bcz_robin(zeros, self.Bz_above)
+
+        bottom_reconstruction = (
+            self.B_background[2, 0] + self.Bz_above - self.Bz_obs
+        )
+        correction_bottom_error = Bc_z[0] - self.Bz_above
+
+        bc_hat = self._dct2(Bc_z)
+        derivative_hat = (3.0 * bc_hat[-1] - 4.0 * bc_hat[-2] + bc_hat[-3]) / (
+            2.0 * float(self.dz)
+        )
+        robin_hat = derivative_hat + self._nfgs_k * bc_hat[-1]
+        robin_hat[0, 0] = 0.0
+        robin = self._idct2(robin_hat)
+
+        phi_c = self._solve_poisson_2d_skip_bottom(
+            Bc_z, "neumann", self.Phi_above_bottom
+        )
+        phi_hat = self._dct2(phi_c)
+        phi_derivative_hat = (
+            3.0 * phi_hat[-1] - 4.0 * phi_hat[-2] + phi_hat[-3]
+        ) / (2.0 * float(self.dz))
+        phi_robin_hat = phi_derivative_hat + self._nfgs_k * phi_hat[-1]
+        phi_robin_hat[0, 0] = 0.0
+        phi_robin = self._idct2(phi_robin_hat)
+
+        k_safe = self._nfgs_k.clone()
+        k_safe[0, 0] = 1.0
+        upward_hat = 0.5 * (bc_hat[-1] + derivative_hat / k_safe)
+        upward_hat[0, 0] = 0.0
+        upward = self._idct2(upward_hat)
+        top = Bc_z[-1]
+        upward_rms = torch.sqrt(torch.mean(upward**2))
+        top_rms = torch.sqrt(torch.mean(top**2))
+
+        bottom_divergence = None
+        bottom_divergence_rms = 0.0
+        bottom_divergence_relative = 0.0
+        bottom_dphi_residual_rms = 0.0
+        if B is not None and self.D0 is not None:
+            bottom_divergence = (
+                self._d_dx_2d(B[0, 0]) + self._d_dy_2d(B[1, 0])
+            )
+            divergence_error = bottom_divergence - self.D0
+            divergence_scale = torch.clamp(
+                torch.sqrt(torch.mean(self.D0**2)), min=1.0e-30
+            )
+            bottom_divergence_rms = float(
+                torch.sqrt(torch.mean(divergence_error**2)).item()
+            )
+            bottom_divergence_relative = float(
+                (torch.sqrt(torch.mean(divergence_error**2)) / divergence_scale).item()
+            )
+        if self._bottom_dphi_c_target is not None:
+            dphi_bottom = (
+                -3.0 * phi_c[0]
+                + 4.0 * phi_c[1]
+                - phi_c[2]
+            ) / (2.0 * float(self.dz))
+            bottom_dphi_residual_rms = float(
+                torch.sqrt(
+                    torch.mean((dphi_bottom - self._bottom_dphi_c_target) ** 2)
+                ).item()
+            )
+
+        diagnostics = {
+            "source_partition_mode": self.source_partition_mode,
+            "weak_field_floor_B2": self.weak_field_floor_b2,
+            "alpha_clip_scale": self.alpha_clip_scale,
+            "bottom_reconstruction_rms": float(
+                torch.sqrt(torch.mean(bottom_reconstruction**2)).item()
+            ),
+            "bottom_reconstruction_max": float(
+                bottom_reconstruction.abs().max().item()
+            ),
+            "correction_bottom_rms": float(
+                torch.sqrt(torch.mean(correction_bottom_error**2)).item()
+            ),
+            "top_robin_rms": float(torch.sqrt(torch.mean(robin**2)).item()),
+            "top_phi_robin_rms": float(
+                torch.sqrt(torch.mean(phi_robin**2)).item()
+            ),
+            "top_upward_source_rms": float(upward_rms.item()),
+            "top_upward_source_ratio": float(
+                (upward_rms / torch.clamp(top_rms, min=1e-30)).item()
+            ),
+            "source_zero_mode_by_height": self._last_source_zero_mode_by_height,
+            "source_zero_mode_ratio_last": (
+                self._source_zero_mode_history[-1]
+                if self._source_zero_mode_history else 0.0
+            ),
+            "source_zero_mode_ratio_max": (
+                max(self._source_zero_mode_history)
+                if self._source_zero_mode_history else 0.0
+            ),
+            "source_zero_mode_tolerance": self.source_zero_mode_tolerance,
+            "source_zero_mode_policy": self.source_zero_mode_policy,
+            "bottom_divergence_projection_weight": (
+                self.bottom_divergence_projection_weight
+            ),
+            "bottom_divergence_robin_weight": self.bottom_divergence_robin_weight,
+            "poloidal_update_mode": self.poloidal_update_mode,
+            "vertical_current_operator": self.vertical_current_operator,
+            "vertical_staggered_face": dict(
+                self._last_staggered_face_diagnostics
+            ),
+            "bottom_divergence_control_mode": (
+                "projection"
+                if self.bottom_divergence_projection_weight > 0.0
+                else (
+                    "mixed_robin"
+                    if self.bottom_divergence_robin_weight > 0.0
+                    else "none"
+                )
+            ),
+            "bottom_divergence_rms": bottom_divergence_rms,
+            "bottom_divergence_relative": bottom_divergence_relative,
+            "bottom_dphi_residual_rms": bottom_dphi_residual_rms,
+            "bottom_divergence_projection_last": (
+                self._bottom_divergence_projection_history[-1]
+                if self._bottom_divergence_projection_history else None
+            ),
+        }
+        toroidal = self.toroidal_boundary_diagnostics or {}
+        raw_jz_rms = float(toroidal.get("raw_jz_rms", 0.0) or 0.0)
+        projected_jz_rms = float(
+            toroidal.get("raw_vs_t_implied_jz_rms", 0.0) or 0.0
+        )
+        diagnostics.update(
+            {
+                "Jz_projected_out_rms": projected_jz_rms,
+                "Jz_projected_out_over_Jz_rms": (
+                    projected_jz_rms / max(raw_jz_rms, 1.0e-30)
+                ),
+                "B_harm_over_Bobs_rms": float(
+                    (self.gaussian_separation_diagnostics or {}).get(
+                        "bottom_horizontal_reconstruction_ratio", 0.0
+                    )
+                ),
+            }
+        )
+        diagnostics.update(self.gaussian_separation_diagnostics or {})
+        if self.horizontal_zero_mode_policy == "coupled_k0":
+            diagnostics["coupled_k0"] = dict(self._k0_diagnostics)
+            if self._H_k0 is not None:
+                diagnostics["coupled_k0"]["profile_by_height"] = [
+                    [float(v.item()) for v in component]
+                    for component in self._H_k0
+                ]
+        elif self.horizontal_zero_mode_policy == "frozen_linear_harmonic":
+            diagnostics["frozen_linear_harmonic"] = dict(self._k0_diagnostics)
+            if self._H_k0 is not None:
+                diagnostics["frozen_linear_harmonic"]["profile_by_height"] = [
+                    [float(v.item()) for v in component]
+                    for component in self._H_k0
+                ]
+        elif self.horizontal_zero_mode_policy == "constrained_spline_harmonic":
+            diagnostics["constrained_spline_harmonic"] = dict(
+                self._k0_diagnostics
+            )
+            if self._H_k0 is not None:
+                diagnostics["constrained_spline_harmonic"][
+                    "profile_by_height"
+                ] = [
+                    [float(v.item()) for v in component]
+                    for component in self._H_k0
+                ]
+        return diagnostics

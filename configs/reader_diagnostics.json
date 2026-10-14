@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "reader_diagnostics",
+  "description": "Height-dependent force-freeness, anisotropic Low--Lou metrics, Q thresholds and selection sensitivity",
+  "entrypoint": "nfgs.reader_diagnostics",
+  "arguments": {
+    "output_root": "{output_root}"
+  },
+  "depends_on": [
+    "td_rho_scan",
+    "low_lou_fp32",
+    "low_lou_fp64",
+    "quantitative_topology"
+  ],
+  "artifacts": [
+    "{output_root}/second_reader_revision/height_profiles.csv",
+    "{output_root}/second_reader_revision/q_threshold_sensitivity.csv",
+    "{output_root}/second_reader_revision/selection_sensitivity.csv"
+  ]
+}

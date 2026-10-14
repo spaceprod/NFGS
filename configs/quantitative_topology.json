@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "id": "quantitative_topology",
+  "description": "Common-seed FastQSL Q maps and endpoint connectivity",
+  "entrypoint": "nfgs._backend.experiments.nfgs_paper.quantitative_topology.run",
+  "arguments": {
+    "field_dir": "{output_root}/rho_full/fields",
+    "nfpt_field_dir": "{project_root}/data/nfpt",
+    "nfpt_variant": "nfpt_fortran_symmetric",
+    "output_dir": "{output_root}/quantitative_topology",
+    "weights": "0,0.1,0.5,1"
+  },
+  "depends_on": [
+    "td_rho_scan",
+    "archived_inputs"
+  ],
+  "artifacts": [
+    "{output_root}/quantitative_topology/metrics.csv"
+  ],
+  "requires_cuda": true,
+  "topology_protocol": {
+    "weights": [
+      0,
+      0.1,
+      0.5,
+      1
+    ],
+    "field_smoothing_sigma_cells": 0,
+    "valid_boundary_flags": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "high_Q_log10_threshold": 2
+  }
+}

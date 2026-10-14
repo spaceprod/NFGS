@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "six_face_helicity",
+  "description": "Six-face potential-field energy and current-carrying helicity",
+  "entrypoint": "nfgs._backend.experiments.nfgs_paper.six_face_helicity.run",
+  "arguments": {
+    "field_dir": "{output_root}/rho_full/fields",
+    "nfpt_field_dir": "{project_root}/data/nfpt",
+    "nfpt_variant": "nfpt_fortran_symmetric",
+    "output_dir": "{output_root}/six_face_helicity",
+    "weights": "0,0.5,1"
+  },
+  "depends_on": [
+    "td_rho_scan",
+    "archived_inputs"
+  ],
+  "artifacts": [
+    "{output_root}/six_face_helicity/metrics.csv"
+  ]
+}

@@ -1,0 +1,7 @@
+# Environment used for this refactoring's verification. Install a suitable
+# PyTorch/CUDA build first; FastQSL needs a matching CUDA toolkit.
+numpy==1.26.4
+scipy==1.14.1
+torch==2.4.0
+pandas==2.2.2
+nbclient==0.10.2

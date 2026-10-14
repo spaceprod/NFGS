@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "rho_grid": [
+    0.0,
+    0.1,
+    0.2,
+    0.3,
+    0.4,
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    0.9,
+    1.0
+  ],
+  "low_lou_rho": 0.5,
+  "precision": "float32",
+  "precision_comparison": "float64",
+  "stopping": {
+    "mode": "sigma_best",
+    "max_iter": 3000,
+    "tolerance": 1e-05,
+    "patience": 40,
+    "improvement_tolerance": 1e-05,
+    "selected_state": "best_sigma"
+  },
+  "horizontal_zero_mode": "frozen_linear_harmonic",
+  "vertical_current": "staggered_face",
+  "poloidal_update": "direct",
+  "scoring_current": "common_fd2_curl",
+  "TD_cases": {
+    "td1": {
+      "parameters": {
+        "R": 110.0,
+        "a": 35.0,
+        "L": 100.0,
+        "d": 50.0,
+        "q": 100.0,
+        "I0": -13.0,
+        "Nt": 2.577,
+        "l_i": 0.5,
+        "p_Bt_ratio": 1.0
+      },
+      "grid_nodes_xyz": [
+        151,
+        251,
+        101
+      ]
+    },
+    "td2": {
+      "parameters": {
+        "R": 100.0,
+        "a": 35.0,
+        "L": 60.0,
+        "d": 60.0,
+        "q": 80.0,
+        "I0": -3.0,
+        "Nt": 8.8,
+        "l_i": 0.5,
+        "p_Bt_ratio": 1.0
+      },
+      "grid_nodes_xyz": [
+        151,
+        251,
+        101
+      ]
+    },
+    "td3": {
+      "parameters": {
+        "R": 110.0,
+        "a": 32.5,
+        "L": 50.0,
+        "d": 50.0,
+        "q": 100.0,
+        "I0": -7.0,
+        "Nt": 5.0,
+        "l_i": 0.5,
+        "p_Bt_ratio": 1.0
+      },
+      "grid_nodes_xyz": [
+        257,
+        351,
+        201
+      ]
+    }
+  },
+  "TD_primary_scoring_nodes_xyz": {
+    "td1": [
+      75,
+      125,
+      100
+    ],
+    "td2": [
+      66,
+      66,
+      30
+    ],
+    "td3": [
+      128,
+      175,
+      200
+    ]
+  },
+  "Low_Lou_spacing_xyz": [
+    0.02531645569620253,
+    0.02531645569620253,
+    0.028169014084507043
+  ],
+  "Low_Lou_scoring_nodes_xyz": [
+    64,
+    64,
+    64
+  ],
+  "CCI_relative_denominator_cutoff": 1e-08,
+  "Low_Lou_cases": {
+    "low_lou_c2": {
+      "n": 1,
+      "m": 1,
+      "l": 0.3,
+      "psi": 0.47123889803846897
+    },
+    "low_lou_ll1": {
+      "n": 1,
+      "m": 1,
+      "l": 0.3,
+      "psi": 0.7853981633974483
+    },
+    "low_lou_ll2": {
+      "n": 3,
+      "m": 1,
+      "l": 0.3,
+      "psi": 2.5132741228718345
+    }
+  },
+  "Low_Lou_paper_labels": {
+    "LL1": "low_lou_ll1",
+    "LL2": "low_lou_ll2",
+    "LL3": "low_lou_c2"
+  }
+}
