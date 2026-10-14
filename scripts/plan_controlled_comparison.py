@@ -11,11 +11,11 @@ def plan(config):
         jobs.append({'job_id':f'job_{len(jobs)+1:04d}','stage':stage,'case':case,'method':method,
                      'settings':settings,'status':'planned_not_executed'})
     for case in config['TD_cases']:
-        for method in ('NFPT_Fortran','NFPT_GPU'):add('E1',case,method)
+        for method in (() if config.get('comparison_policy',{}).get('published_NFPT_immutable') else ('NFPT_Fortran','NFPT_GPU')):add('E1',case,method)
         for value in rho:add('E1_E2',case,'NFGS',rho=value)
         for weight,seed in itertools.product(weights,seeds):add('E2',case,'NF2',boundary_weight_multiplier=weight,seed=seed)
     for case in config['Low_Lou_cases']:
-        for method in ('NFPT_Fortran','NFPT_GPU'):add('E3',case,method)
+        for method in (() if config.get('comparison_policy',{}).get('published_NFPT_immutable') else ('NFPT_Fortran','NFPT_GPU')):add('E3',case,method)
         for value in config['NFGS']['low_lou_rho_grid']:add('E3',case,'NFGS',rho=value)
         for seed in seeds:add('E3',case,'NF2',boundary_weight_multiplier=1.0,seed=seed)
     return {'status':'draft_design_not_execution_ready','config_sha256':hashlib.sha256(json.dumps(config,sort_keys=True).encode()).hexdigest(),
@@ -25,7 +25,7 @@ def plan(config):
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--config',type=Path,default=Path('configs/controlled_comparison.json'));p.add_argument('--output',type=Path,required=True)
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--config',type=Path,default=Path('configs/controlled_published_nfpt_20261014.json'));p.add_argument('--output',type=Path,required=True)
     a=p.parse_args();result=plan(json.loads(a.config.read_text()));a.output.parent.mkdir(parents=True,exist_ok=True);a.output.write_text(json.dumps(result,indent=2)+'\n')
     print(json.dumps({k:result[k] for k in ('status','primary_job_count','NF2_training_count','additional_not_counted')},indent=2))
 
