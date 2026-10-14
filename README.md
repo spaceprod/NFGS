@@ -138,4 +138,40 @@ See `docs/reproduction.md` for the manuscript-to-experiment mapping and
 Please cite the accompanying NFGS manuscript and Yi et al. (2022) for NFPT.
 FastQSL retains its CC BY-NC-SA 4.0 license; see `THIRD_PARTY.md`.
 
+## Controlled comparison design (not yet executed)
+
+The [NFPT–NF2 comparison plan](docs/controlled_comparison_plan_ko.md) separates
+archived evidence from future matched-input experiments and manuscript claims.
+NF2's verified upstream commit, bottom-only requirements, matched tuning budgets,
+timing boundaries, sensitivity studies and source/coordinate gates are in
+`configs/controlled_comparison.json`. The design is deliberately marked draft.
+
+```bash
+python scripts/plan_controlled_comparison.py --output results/controlled_design/jobs.json
+python scripts/build_comparison_report.py --output-dir results/controlled_design/report
+python evaluate.py --reference case/reference.npz --field run/field.npz \
+  --boundary case/boundary.npz --config case/evaluation.json --output run/metrics.json
+```
+
+`evaluate.py` requires explicit coordinates and units; it never infers a grid
+from a shape or accepts solver-specific current arrays for scoring. It uses
+common full-volume FD2 curl and full-footprint GS, with pixel/cutoff and global
+L2 CCI errors. FastQSL, twist, energy/helicity and method adapters remain separate
+implementation gates; generating a draft job list does not run these methods.
+The report command reproduces **archived** full-rho and precision tables only.
+
+The NFPT **Fortran** solver is private: neither its source, executables nor local
+build scripts are included in this repository or releases. Common evaluation
+and archived comparison fields remain public; NFPT execution requires separate
+authorized access to the private solver. Before any publication, run:
+
+```bash
+python scripts/check_publication_contents.py
+```
+
+The controlled-comparison overview is in
+`notebooks/controlled_comparison_overview.ipynb`. The verified, case-dependent
+NF2 template is `configs/controlled/nf2_bottom_only_template.json`; placeholders
+and geometry/normalization must be resolved before training.
+
 `evaluate.py` provides common evaluation of supplied magnetic fields. The private NFPT Fortran solver and unauthorized external solver materials are not distributed.
