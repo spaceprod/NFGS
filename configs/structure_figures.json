@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "structure_figures",
+  "description": "Render Q, twist and helicity figures",
+  "entrypoint": "nfgs._backend.scripts.plot_nfgs_referee_revision_figures",
+  "arguments": {
+    "campaign_root": "{output_root}",
+    "output_dir": "{output_root}/figures"
+  },
+  "depends_on": [
+    "quantitative_topology",
+    "twist_apex",
+    "six_face_helicity"
+  ],
+  "artifacts": []
+}

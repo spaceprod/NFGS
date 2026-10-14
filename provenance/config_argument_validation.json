@@ -1,0 +1,27 @@
+{
+  "passed": [
+    "archived_inputs",
+    "audit",
+    "common_diagnostics",
+    "diagnostic_figures",
+    "extended_manufactured",
+    "factorized_ablation",
+    "fieldline_views",
+    "low_lou_fp32",
+    "low_lou_fp64",
+    "modal_verification",
+    "preflight",
+    "quantitative_topology",
+    "reader_diagnostics",
+    "regularization",
+    "rho_figures",
+    "rho_gamma_scaling",
+    "six_face_helicity",
+    "source_support",
+    "structure_figures",
+    "td_rho_scan",
+    "twist_apex"
+  ],
+  "failed": [],
+  "count": 21
+}

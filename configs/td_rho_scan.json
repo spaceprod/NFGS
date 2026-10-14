@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "id": "td_rho_scan",
+  "description": "Reconstruct all three TD cases at eleven CCI weights",
+  "entrypoint": "nfgs._backend.scripts.run_nfgs_td_robin_weight_sweep",
+  "arguments": {
+    "output_dir": "{output_root}/rho_full",
+    "benchmarks": "td1,td2,td3",
+    "weights": "0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1",
+    "device": "{device}",
+    "dtype": "float32",
+    "max_iter": "3000",
+    "stop_mode": "sigma_best",
+    "tol": "1e-5",
+    "patience": "40",
+    "sigma_improvement_tol": "1e-5",
+    "record_iteration_diagnostics": true,
+    "horizontal_zero_mode_policy": "frozen_linear_harmonic",
+    "vertical_current_operator": "staggered_face",
+    "poloidal_update_mode": "direct",
+    "td_calculation_domain_mode": "mudpack"
+  },
+  "depends_on": [
+    "preflight"
+  ],
+  "artifacts": [
+    "{output_root}/rho_full/summary.json"
+  ],
+  "supports_force": true,
+  "td_cases": {
+    "td1": {
+      "parameters": {
+        "R": 110.0,
+        "a": 35.0,
+        "L": 100.0,
+        "d": 50.0,
+        "q": 100.0,
+        "I0": -13.0,
+        "Nt": 2.577,
+        "l_i": 0.5,
+        "p_Bt_ratio": 1.0
+      },
+      "grid_nodes_xyz": [
+        151,
+        251,
+        101
+      ]
+    },
+    "td2": {
+      "parameters": {
+        "R": 100.0,
+        "a": 35.0,
+        "L": 60.0,
+        "d": 60.0,
+        "q": 80.0,
+        "I0": -3.0,
+        "Nt": 8.8,
+        "l_i": 0.5,
+        "p_Bt_ratio": 1.0
+      },
+      "grid_nodes_xyz": [
+        151,
+        251,
+        101
+      ]
+    },
+    "td3": {
+      "parameters": {
+        "R": 110.0,
+        "a": 32.5,
+        "L": 50.0,
+        "d": 50.0,
+        "q": 100.0,
+        "I0": -7.0,
+        "Nt": 5.0,
+        "l_i": 0.5,
+        "p_Bt_ratio": 1.0
+      },
+      "grid_nodes_xyz": [
+        257,
+        351,
+        201
+      ]
+    }
+  },
+  "profiles": {
+    "quick": {
+      "arguments": {
+        "benchmarks": "td1",
+        "weights": "0,0.5",
+        "max_iter": 3
+      },
+      "td_cases": {
+        "td1": {
+          "parameters": {
+            "R": 110.0,
+            "a": 35.0,
+            "L": 100.0,
+            "d": 50.0,
+            "q": 100.0,
+            "I0": -13.0,
+            "Nt": 2.577,
+            "l_i": 0.5,
+            "p_Bt_ratio": 1.0
+          },
+          "grid_nodes_xyz": [
+            18,
+            18,
+            18
+          ]
+        }
+      }
+    }
+  }
+}

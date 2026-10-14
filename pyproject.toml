@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nfgs"
+version = "0.1.0"
+description = "Gaussian-separated nonlinear force-free reconstruction with coronal-current imprint control"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = {text = "BSD-3-Clause; vendored FastQSL is CC BY-NC-SA 4.0"}
+authors = [{name = "NFGS contributors"}]
+dependencies = ["numpy>=1.26,<2.3", "torch>=2.3", "scipy>=1.11,<2", "matplotlib>=3.8", "psutil>=5.9", "PyYAML>=6"]
+
+[project.optional-dependencies]
+notebook = ["pandas>=2", "jupyterlab>=4", "ipykernel>=6", "nbformat>=5", "nbclient>=0.10", "ipywidgets>=8"]
+topology = ["cupy-cuda12x>=13", "nvidia-cuda-nvcc-cu12>=12", "nvidia-cuda-nvrtc-cu12>=12"]
+render = ["pyvista>=0.43"]
+
+[tool.setuptools]
+py-modules = ["nfgs_solver"]
+
+[tool.setuptools.packages.find]
+include = ["nfgs*"]

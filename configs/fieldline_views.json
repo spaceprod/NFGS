@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "fieldline_views",
+  "description": "Common-reference-seed total-field views with orthographic camera and glossy tubes",
+  "entrypoint": "nfgs.fieldlines",
+  "arguments": {
+    "field_dir": "{output_root}/rho_full/fields",
+    "nfpt_field_dir": "{project_root}/data/nfpt",
+    "output_dir": "{output_root}/figures",
+    "weights": "1,0.5,0.1,0",
+    "tube_radius": 3.8
+  },
+  "depends_on": [
+    "td_rho_scan",
+    "archived_inputs"
+  ],
+  "artifacts": [
+    "{output_root}/figures/fieldline_comparison.png",
+    "{output_root}/figures/fieldline_manifest.json"
+  ]
+}

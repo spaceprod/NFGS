@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "Please cite the accompanying NFGS manuscript and this software version."
+type: software
+title: "NFGS: Gaussian Separation with Coronal-Current Imprint Control"
+version: 0.1.0
+date-released: 2026-10-13
+authors:
+  - family-names: Kim
+    given-names: Youngjae
+  - family-names: Yi
+    given-names: Sibaek
+  - family-names: Jeon
+    given-names: Mingyu
+  - family-names: Jang
+    given-names: Yeonwoo
+  - family-names: Moon
+    given-names: Yong-Jae
+license: BSD-3-Clause
+repository-code: "https://github.com/spaceprod/NFGS"

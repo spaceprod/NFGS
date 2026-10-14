@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "modal_verification",
+  "description": "Manufactured modal solutions and grid convergence",
+  "entrypoint": "nfgs._backend.experiments.nfgs_paper.modal_verification.run",
+  "arguments": {
+    "output_dir": "{output_root}/modal_verification",
+    "device": "{device}",
+    "dtypes": "float32,float64",
+    "grids": "17,33,65",
+    "longwave_nx": "17,33,65,129",
+    "timing_repeats": 5,
+    "zero_mode_policy": "frozen_linear_harmonic"
+  },
+  "depends_on": [
+    "preflight"
+  ],
+  "artifacts": [
+    "{output_root}/modal_verification/summary.json"
+  ],
+  "profiles": {
+    "quick": {
+      "arguments": {
+        "grids": "9,17,33",
+        "longwave_nx": "9,17,33",
+        "timing_repeats": 1
+      }
+    }
+  }
+}

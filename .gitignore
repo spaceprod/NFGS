@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+results/
+data/nfpt/
+build/
+dist/
+.local/
+*.log
+
+release_data/
+
+# Privately supplied external solver materials
+**/*[Ww]iegelmann*
+**/nlfff2012*
+reference_results/classical_comparison/
+reference_results/boundary_relaxed_comparison/
+nfgs/classical_io.py
+nfgs/classical_render.py
+configs/classical_fieldline_views.json
+scripts/build_classical_comparison.py
+notebooks/controlled_comparison_overview.ipynb

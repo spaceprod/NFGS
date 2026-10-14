@@ -1,0 +1,18 @@
+{
+  "original_source_files_unchanged": true,
+  "independent_single_file_import": true,
+  "initial_conditions_bitwise_equal": [
+    "gs_cfcf",
+    "cfcf",
+    "soft_cfcf"
+  ],
+  "nonlinear_iteration_bitwise_equal": true,
+  "boundary_grid_xyz": [
+    11,
+    9,
+    7
+  ],
+  "dtype": "float64",
+  "rho": 0.5,
+  "device": "cpu"
+}

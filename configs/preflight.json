@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "preflight",
+  "description": "preflight",
+  "entrypoint": "nfgs.environment",
+  "arguments": {
+    "device": "{device}"
+  },
+  "depends_on": [],
+  "artifacts": []
+}

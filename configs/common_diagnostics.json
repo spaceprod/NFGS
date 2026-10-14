@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "id": "common_diagnostics",
+  "description": "Common FD2 curl, boundary imprint, height profiles and energy diagnostics",
+  "entrypoint": "nfgs._backend.scripts.recompute_td_referee_diagnostics",
+  "arguments": {
+    "field_dir": "{output_root}/rho_full/fields",
+    "case_meta_dir": "{output_root}/rho_full/fields",
+    "nfpt_field_dir": "{project_root}/data/nfpt",
+    "nfpt_variant": "nfpt_fortran_symmetric",
+    "source_metrics": "{output_root}/rho_full/robin_w0p0.json",
+    "output_dir": "{output_root}/common_diagnostics",
+    "figure_dir": "{output_root}/figures",
+    "weights": "0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1",
+    "profile_weights": "0,0.5,1",
+    "extended_volume_metrics": true
+  },
+  "depends_on": [
+    "td_rho_scan",
+    "archived_inputs"
+  ],
+  "artifacts": [
+    "{output_root}/common_diagnostics/metrics_by_domain.csv",
+    "{output_root}/common_diagnostics/manifest.json"
+  ]
+}

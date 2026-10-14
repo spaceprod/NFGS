@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "description": "Reproduce current manuscript results; rho=0.5 Low--Lou family; published NFPT scores remain attributed reference data.",
+  "experiments": [
+    "preflight",
+    "archived_inputs",
+    "td_rho_scan",
+    "low_lou_fp32",
+    "low_lou_fp64",
+    "common_diagnostics",
+    "rho_figures",
+    "six_face_helicity",
+    "quantitative_topology",
+    "twist_apex",
+    "diagnostic_figures",
+    "structure_figures",
+    "reader_diagnostics",
+    "audit",
+    "modal_verification",
+    "extended_manufactured",
+    "regularization",
+    "factorized_ablation",
+    "rho_gamma_scaling",
+    "source_support",
+    "fieldline_views"
+  ],
+  "profiles": {
+    "paper": {
+      "experiments": [
+        "preflight",
+        "archived_inputs",
+        "td_rho_scan",
+        "low_lou_fp32",
+        "low_lou_fp64",
+        "regularization",
+        "common_diagnostics",
+        "rho_figures",
+        "six_face_helicity",
+        "quantitative_topology",
+        "twist_apex",
+        "diagnostic_figures",
+        "structure_figures",
+        "reader_diagnostics",
+        "audit",
+        "modal_verification",
+        "extended_manufactured",
+        "factorized_ablation",
+        "rho_gamma_scaling",
+        "fieldline_views",
+        "source_support"
+      ]
+    },
+    "quick": {
+      "experiments": [
+        "modal_verification",
+        "extended_manufactured",
+        "td_rho_scan",
+        "low_lou_fp32"
+      ]
+    }
+  }
+}

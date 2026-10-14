@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "url": "https://github.com/spaceprod/NFGS/releases/download/v0.1.0/nfpt_comparison_fields.tar",
+  "archive_name": "nfpt_comparison_fields.tar",
+  "archive_sha256": "af7dc54eee4112f8579e5702add4fc419f4b5393f4b8180522d5c35d1b922e8a",
+  "files": [
+    {
+      "name": "td1__nfpt_fortran_symmetric.npz",
+      "sha256": "c761c9f465a65c96b9da13263906140398860d3b0c6ad3cd7b2db01837fa1aab",
+      "bytes": 81279477,
+      "origin": "Archived Fortran NFPT output used by the manuscript structural comparison; distinct from published metric values."
+    },
+    {
+      "name": "td2__nfpt_fortran_symmetric.npz",
+      "sha256": "14528addc4f04bed050321c9392ba973cdb9b69d9ad4a8a0c383840162602fd9",
+      "bytes": 81887298,
+      "origin": "Archived Fortran NFPT output used by the manuscript structural comparison; distinct from published metric values."
+    },
+    {
+      "name": "td3__nfpt_fortran_symmetric.npz",
+      "sha256": "d1bd9bb96464fd497e13d2e0e0cb29e83b44133ce0bec53947358ca8d2dbecb3",
+      "bytes": 387363837,
+      "origin": "Archived Fortran NFPT output used by the manuscript structural comparison; distinct from published metric values."
+    }
+  ],
+  "provenance_note": "Frozen NFPT comparison inputs. NFGS reconstructs its own fields anew; these are neither NFGS outputs nor a claim of re-running the original NFPT code."
+}

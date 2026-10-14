@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "diagnostic_figures",
+  "description": "Render common-domain diagnostics",
+  "entrypoint": "nfgs._backend.scripts.plot_td_referee_figures",
+  "arguments": {
+    "diagnostic_dir": "{output_root}/common_diagnostics",
+    "source_metrics": "{output_root}/rho_full/robin_w0p0.json",
+    "output_dir": "{output_root}/figures"
+  },
+  "depends_on": [
+    "common_diagnostics"
+  ],
+  "artifacts": []
+}
