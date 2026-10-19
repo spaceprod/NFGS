@@ -1,0 +1,27 @@
+{
+  "source_commit": "e576a5d5fcfa2783651a44d3d3085f9a7b8b0dbb",
+  "files_sha256": {
+    "common_diagnostics/energy_divergence_by_domain.csv": "fe254f1c7b7b4cd0efff381f050ce58657d43b6e1a1892aa6927371b68d60fcd",
+    "common_diagnostics/force_free_region_budgets.csv": "4b50b82d7106a006fc5bef79a5b30597d0b1dfd680a1866661237c1c940ed45a",
+    "common_diagnostics/headline_common_fd2_protocol.csv": "470efff74cd5911c7010c230b358db29c05d6c0bb0b38e5fc0bb987c32c1f3b8",
+    "common_diagnostics/height_profiles.csv": "fce8a4cb97a59fce18a1781549bd148dac9903764c3ee1f644c9ecf71e452843",
+    "common_diagnostics/metrics_by_domain.csv": "11f920a194490fc810cd52acc5a694ed6dc2d2dc69794db075201ef2796ddb93",
+    "common_diagnostics/release_metrics_primary.csv": "3f901c3041062b06fd4e46c60f8d15b7fa898d414fa8605e9c744ed912727b27",
+    "common_diagnostics/represented_component_diagnostics.csv": "b2af3b8cde4f33864f68889e10f31e2d346bb749b79f04b3e94cdcf67f079ce9",
+    "factorized_ablation/metrics_all.csv": "378fc8ae143f128fe2a1f8fe2b6eb6eefe19004642cdb92ade224d0b11909915",
+    "low_lou_family_rho0p5/float32/metrics.csv": "0ecee44ad48fc2bd6b494582a79af4526864ed6872c535f1d77bdc0e075b4e8f",
+    "low_lou_family_rho0p5/float64/metrics.csv": "1003cea7cc5ab872b039bd45b4ee9b937b5c01259d2d3e414ca1243f9f47806a",
+    "published_methods.csv": "fe0a81d329b37620fa15622b0f91ddf342a0c638d4075add4c1a5c05de952e87",
+    "quantitative_topology/metrics.csv": "e1c294f0e1725386a065f2d583fbdac79e4ed1a5c799c5ed0a7a2021913d7e2a",
+    "regularization/regularization_metrics.csv": "ac34d9db69f6631749fa822571fb1346b9760baa663b153e269d2b3f114b7aa8",
+    "rho_full/metrics_all.csv": "ee8f286cb7c193e97201e73fcd0eaf776d8440a8c1f833d3fdcad0a53c5735e9",
+    "rho_full/metrics_with_erel_bgt.csv": "c893bf925828df2433eee7e9958977fb18d2bb08789b73bfd51cfb92b6a4d007",
+    "rho_gamma_scaling/metrics_all.csv": "b88c962957895c2fde541843ae80c8cc785b9f666c727ab6bb10649afd0085c0",
+    "second_reader_revision/force_free_region_budgets.csv": "be436e133b003ccca1149edf3b4b7825d2bb1e38d3032ffa409289bedc6becb7",
+    "second_reader_revision/height_profiles.csv": "edf3b140311eeeb8cb6db169e7083aa8e195264a73971c7690dd67a6babc801b",
+    "second_reader_revision/q_threshold_sensitivity.csv": "86425067e80405c6110d86bf44cc51752fe63ef97e03b847f07f9410a88307ed",
+    "second_reader_revision/selection_sensitivity.csv": "9cc0fd692550ccd882faba3fc78a2df9c7e04a8bd61bf187a2b76ba45c1d22a3",
+    "six_face_helicity/metrics.csv": "54339f071330b8582dbea8e3a4bdad9b33d36da324fff66a5d5724df6280c83f",
+    "twist_apex/metrics.csv": "997cf87faeb63b08fe3964459a567c7e8a26dd7c8099ac8e5add4f66c62a70a9"
+  }
+}
