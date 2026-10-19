@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "current_evidence",
+  "description": "Unified TD and Low--Lou evidence tables, including rho baselines and CCI",
+  "entrypoint": "nfgs.current_evidence",
+  "arguments": {
+    "campaign_root": "{output_root}"
+  },
+  "depends_on": [
+    "reader_diagnostics",
+    "six_face_helicity",
+    "twist_apex",
+    "low_lou_rho0",
+    "low_lou_rho1"
+  ],
+  "artifacts": [
+    "{output_root}/evidence_summary.json",
+    "{output_root}/low_lou_comparison.json"
+  ]
+}

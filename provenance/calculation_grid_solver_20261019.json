@@ -1,0 +1,13 @@
+{
+  "solver_sha256": "f2a9fe4ff19ea3e22e074c5fc1c292ae401cd05010cfb65bbdb15b56de564c99",
+  "previous_solver_sha256": "3cf032f3f86517708580f78469b884047242e191ec6d6a5431bde60da15d6a7a",
+  "source_component_sha256": {
+    "grid": "5159ca63ad26d29a6a68c5294324df6029682ce7202207ca251284d3d2e06202",
+    "base": "4ebb6b8023a54e243fd2f20d11e23dc3324529c3a598546ad392c2ce27c89aaa",
+    "stable": "e29420207dc4c2b0a6798e654bf236215a5bb0626007f860569201319c4f7c91",
+    "nfgs": "49c8a6a5200789f413a161b445c2f62dc0f7d043288c939fa7c6032540ced04d"
+  },
+  "scope": "NFGS bottom-current calculation on physical calculation grid; inherited NFPT base and lateral ghost operators unchanged",
+  "previous_implementation_preserved": true,
+  "private_Fortran_distributed": false
+}

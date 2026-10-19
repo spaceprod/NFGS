@@ -137,5 +137,14 @@
     "LL2": "low_lou_ll2",
     "LL3": "low_lou_c2"
   },
+  "low_lou_rho_grid": [
+    0.0,
+    0.4,
+    0.5,
+    1.0
+  ],
+  "bottom_current_domain": "physical_calculation_grid",
+  "common_weight_selection": "shared min/max over all 33 TD states; equal mean Euclidean distance in CCI error and common FD2 sigma_J",
+  "common_selected_rho": 0.4,
   "comparison_methods": []
 }

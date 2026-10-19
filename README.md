@@ -3,10 +3,10 @@
 Gaussian-separated nonlinear force-free reconstruction with explicit control
 of the photospheric coronal-current imprint (CCI).
 
-Companion code for **Fast Reconstruction of Solar Coronal Nonlinear Force-Free
+Companion code for **GPU-Accelerated Reconstruction of Solar Coronal Nonlinear Force-Free
 Fields using Gaussian Separation with Coronal-Current Imprint Control**.
 The production settings reproduce the current manuscript's TD weight scan,
-Low--Lou validation at rho = 0.5, common-current metrics, FastQSL connectivity
+Low--Lou validation at rho = 0, 0.5 and 1, common-current metrics, FastQSL connectivity
 and twist, six-face energy and helicity, and diagnostic weight sensitivity.
 
 ## Layout
@@ -85,7 +85,7 @@ python -m nfgs.inputs --manifest configs/archived_inputs_manifest.json \
 ```
 
 The default campaign reconstructs 33 TD model-weight pairs and the three
-Low--Lou cases in both precisions, then derives the manuscript diagnostics.
+Low--Lou cases at rho=0.5 in both precisions and at rho=0 and 1 in FP32, then derives the manuscript diagnostics and unified evidence summary.
 `configs/paper_protocol.json` explicitly records source parameters, reference
 grids, scoring domains, rho grid, zero-mode treatment, current operator and
 stopping settings. TD case parameters are also applied directly from the TD

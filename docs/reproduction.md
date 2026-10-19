@@ -6,6 +6,8 @@
 | Primary scoring domains and common curl | `common_diagnostics.py` | `common_diagnostics.json` | `common_diagnostics/metrics_by_domain.csv` |
 | Practical rho choice | `rho_figures.py` | `rho_figures.json` | `figures/` |
 | Low--Lou LL1, LL2, LL3 at rho=0.5 | `low_lou_fp32.py`, `low_lou_fp64.py` | respective JSON files | `low_lou_family_rho0p5/` |
+| Low--Lou rho=0 and 1 baselines | `low_lou_rho0.py`, `low_lou_rho1.py` | respective JSON files | `low_lou_baselines/` |
+| Unified current evidence | `current_evidence.py` | `current_evidence.json` | `evidence_summary.json`, `low_lou_comparison.json` |
 | Appendix A limiter/floor activation | `regularization.py` | `regularization.json` | `regularization/regularization_metrics.csv` |
 | Q maps, footprint overlap and endpoints | `quantitative_topology.py` | `quantitative_topology.json` | `quantitative_topology/metrics.csv` and raw bundles |
 | Twist-core apex and amplitude | `twist_apex.py` | `twist_apex.json` | `twist_apex/metrics.csv` |
@@ -75,3 +77,5 @@ Git history. `nfgs.inputs` verifies its archive checksum and each NPZ checksum;
 unexpected archive members are rejected. The manifest is included in Git.
 `reference_results/` contains small, explicitly archived tables and figures;
 `results/` and downloaded fields are ignored by Git.
+
+The current-evidence stage also traces the selected common weight if it is absent from the standard structural diagnostics. The overview notebook reads this choice from the exported summary and includes the Low--Lou CCI baselines.

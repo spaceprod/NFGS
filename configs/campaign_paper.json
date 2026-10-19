@@ -15,6 +15,9 @@
     "diagnostic_figures",
     "structure_figures",
     "reader_diagnostics",
+    "low_lou_rho0",
+    "low_lou_rho1",
+    "current_evidence",
     "audit",
     "modal_verification",
     "extended_manufactured",
@@ -42,6 +45,9 @@
         "structure_figures",
         "reader_diagnostics",
         "fieldline_views",
+        "low_lou_rho0",
+        "low_lou_rho1",
+        "current_evidence",
         "audit"
       ]
     },

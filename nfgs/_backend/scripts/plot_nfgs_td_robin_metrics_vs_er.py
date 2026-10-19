@@ -1227,7 +1227,9 @@ def plot_sigmaj_tradeoff_pair(
                         cmap=cmap, norm=norm, marker=MARKERS[bench], s=35, edgecolors="k", linewidths=0.35, zorder=3)
         selected=next(r for r in group if abs(float(r[RHO_KEY])-chosen_rho)<1e-6)
         axes[0].scatter([selected["sigma_J"]], [selected[EREL_KEY]], s=135, facecolors="none", edgecolors="k", lw=1.2, zorder=4)
-    axes[0].set(xlabel=METRIC_LABELS["sigma_J"], ylabel=EREL_LABEL, xlim=(0,.30), ylim=(0,.35))
+    axes[0].set(xlabel=METRIC_LABELS["sigma_J"], ylabel=EREL_LABEL,
+                xlim=(0,max(.30,1.10*max(float(r['sigma_J']) for r in rows))),
+                ylim=(0,max(.35,1.10*max(float(r[EREL_KEY]) for r in rows))))
     axes[0].grid(alpha=.25, lw=.6)
     handles=[Line2D([],[],marker=MARKERS[b],ls="none",color=".35",label=b.upper()) for b in ("td1","td2","td3")]
     handles.append(Line2D([],[],marker="o",ls="none",markerfacecolor="none",color="k",label=rf"$\rho={chosen_rho:g}$"))

@@ -8,7 +8,7 @@
     "nfpt_field_dir": "{project_root}/data/nfpt",
     "nfpt_variant": "nfpt_fortran_symmetric",
     "output_dir": "{output_root}/twist_apex",
-    "weights": "0,0.5,1"
+    "weights": "0,0.1,0.5,1"
   },
   "depends_on": [
     "td_rho_scan",

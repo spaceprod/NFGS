@@ -137,7 +137,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         required=True,
         help=(
-            "Required rho in (0, 1]: blend between the first-interior "
+            "Required rho in [0, 1]: blend between the first-interior "
             "poloidal PDE row and the bottom derivative condition."
         ),
     )
@@ -352,8 +352,8 @@ def run_case(case: dict, *, device: str, dtype: torch.dtype, max_iter: int, args
 
 def main() -> int:
     args = parse_args()
-    if not 0.0 < args.mixed_robin_weight <= 1.0:
-        raise SystemExit("--mixed-robin-weight must be in (0, 1]")
+    if not 0.0 <= args.mixed_robin_weight <= 1.0:
+        raise SystemExit("--mixed-robin-weight must be in [0, 1]")
     weight_tag = f"{args.mixed_robin_weight:.6g}".replace(".", "p")
     if args.output_dir is None:
         args.output_dir = (

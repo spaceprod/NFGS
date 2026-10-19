@@ -37,13 +37,11 @@ def load_tables(root):
 
 def primary_td(frame):
     keep = (frame["current_source"] == "common_fd2_curl") & frame["rho"].notna()
-    keep &= ((frame["benchmark"] == "td2") & (frame["domain"] == "protocol")) | (
-        (frame["benchmark"] != "td2") & (frame["domain"] == "central_half")
-    )
+    keep &= frame["domain"] == "protocol"
     return frame.loc[keep].sort_values(["benchmark", "rho"]).copy()
 
 
-def plot_tradeoff(frame):
+def plot_tradeoff(frame, selected_rho=0.5):
     fig, axes = plt.subplots(1, 3, figsize=(14, 4.1), layout="constrained")
     for ax, case in zip(axes, ["td1", "td2", "td3"]):
         group = frame[frame.benchmark == case].sort_values("rho")
@@ -57,7 +55,7 @@ def plot_tradeoff(frame):
             vmax=1,
             s=65,
         )
-        selected = group[np.isclose(group.rho, 0.5)]
+        selected = group[np.isclose(group.rho, selected_rho)]
         ax.scatter(
             selected.E_rel_Bgt_domain,
             selected.sigma_J,

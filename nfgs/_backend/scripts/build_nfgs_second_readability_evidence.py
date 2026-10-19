@@ -95,14 +95,14 @@ def repair_low_lou() -> list[dict]:
     return audit
 
 
-def td_profiles() -> tuple[list[dict], list[dict]]:
+def td_profiles(selected_weight=.5) -> tuple[list[dict], list[dict]]:
     profiles, budgets = [], []
     base = DATA / "rho_full/fields"
     for case in ("td1", "td2", "td3"):
         meta = json.loads((base / f"{case}__case_meta.json").read_text())
         spacing = float(meta["dims"][3])
         slices = tuple(slice(*entry) for entry in meta["metric_slices"])
-        for rho in (None, 0.0, 0.5, 1.0):
+        for rho in (None, 0.0, selected_weight, 1.0):
             method = "analytic_reference" if rho is None else f"nfgs_rho_{rho:.1f}"
             suffix = "reference" if rho is None else f"nfgs__gs_cfcf__robin_w{rho:.1f}".replace(".", "p")
             path = base / f"{case}__{suffix}.npz"
@@ -122,7 +122,7 @@ def td_profiles() -> tuple[list[dict], list[dict]]:
     styles = [
         ("analytic_reference", "Reference", "black"),
         ("nfgs_rho_0.0", r"$\rho=0$", "#2477b5"),
-        ("nfgs_rho_0.5", r"$\rho=0.5$", "#803bb2"),
+        (f"nfgs_rho_{selected_weight:.1f}", rf"$\rho={selected_weight:g}$", "#803bb2"),
         ("nfgs_rho_1.0", r"$\rho=1$", "#dc792d"),
     ]
     for col, case in enumerate(("td1", "td2", "td3")):
