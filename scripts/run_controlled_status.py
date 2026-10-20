@@ -35,12 +35,9 @@ def report(root):
         elif any(method==job['method'] for method,base in observed):
             pool=[v for (method,base),values in observed.items() if method==job['method'] for v in values]
             duration=statistics.median(pool);basis[str(key)]='observed_same_method_other_case_preliminary'
-        elif job['method']=='NF2' and progress.get('method')=='NF2' and progress.get('phase')=='training' and progress.get('step',0)>=100:
-            duration=float(progress['training_elapsed_s'])/progress['step']*15000+max(30,float(progress['training_elapsed_s'])/progress['step']*15000*.1);basis[str(key)]='current_production_step_rate'
-        else:duration=float(job.get('prior_duration_s',2400 if job['method']=='NF2' else 180));basis[str(key)]='initial_prior_not_measured'
+        else:duration=float(job.get('prior_duration_s',180));basis[str(key)]='initial_prior_not_measured'
         factor=float(job.get('runtime_scale',1))
-        # NF2 has a fixed training budget; only the inference portion scales with grid size.
-        if factor!=1:duration*=.9+.1*factor if job['method']=='NF2' else factor
+        if factor!=1:duration*=factor
         estimates[job['id']]=duration
     outstanding=[j for j in jobs if j.get('status') in ('pending','running','retry')]
     remaining=sum(estimates[j['id']] for j in outstanding)

@@ -6,7 +6,7 @@ import psutil
 from nfgs.controlled_cases import prepare_case,dump
 from nfgs.comparison_policy import read_policy,require_allowed_job,normalize_pause_timings
 ROOT=Path(__file__).resolve().parents[1]
-CORE=ROOT/'.venv/bin/python';NF2_PY=ROOT/'.local/envs/nf2/bin/python'
+CORE=ROOT/'.venv/bin/python'
 
 
 def active(pid):
@@ -55,13 +55,7 @@ def main():
                     heartbeat(bootstrap['pid']);time.sleep(5)
                 if not (out/'result.json').exists():raise RuntimeError('Adopted live worker exited without a result; state preserved for retry')
             if not (out/'result.json').exists():
-                if job['method']=='NF2':
-                    while not (ROOT/'.local/controlled/nf2_ready').exists():
-                        installpid=int((ROOT/'.local/controlled/nf2_install_pid').read_text())
-                        if not active(installpid):raise RuntimeError('NF2 environment setup failed; see private nf2_install.log')
-                        state['status']='waiting_for_NF2_environment';state['updated_at']=time.time();dump(statepath,state);time.sleep(10)
-                    command=[NF2_PY,ROOT/'scripts/run_nf2_controlled.py','--job',path,'--root',root]
-                elif job['method']=='NFPT_Fortran':command=[CORE,ROOT/'.local/controlled/run_nfpt_private.py','--job',path,'--root',root]
+                if job['method']=='NFPT_Fortran':command=[CORE,ROOT/'.local/controlled/run_nfpt_private.py','--job',path,'--root',root]
                 else:command=[CORE,ROOT/'scripts/run_controlled_native.py','--job',path,'--root',root]
                 code=execute(command,out/'worker.log',env,heartbeat)
                 if code:raise RuntimeError(f'Solver exited {code}; see {out}/worker.log')

@@ -15,7 +15,9 @@ from types import SimpleNamespace
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--job',type=Path,required=True);p.add_argument('--root',type=Path,required=True);a=p.parse_args()
-    job=json.loads(a.job.read_text());out=a.root/'runs'/job['id'];out.mkdir(parents=True,exist_ok=True);start=time.perf_counter();started_wall=time.time()
+    job=json.loads(a.job.read_text())
+    if job['method'] not in ['NFGS','NFPT_GPU','NFGS_legacy']:raise ValueError('Unsupported native solver method')
+    out=a.root/'runs'/job['id'];out.mkdir(parents=True,exist_ok=True);start=time.perf_counter();started_wall=time.time()
     folder=prepare_case(a.root,job['case_spec']);meta=json.loads((folder/'case.json').read_text())
     with np.load(folder/'boundary.npz') as data:boundary={k:np.asarray(data[k]) for k in ['Bx','By','Bz']}
     nx,ny,nz=meta['grid_xyz'];dx,dy,dz=meta['spacing_xyz'];settings=job['settings'];solver_diagnostic=job.get('stage')!='timing';diagnostic=bool(settings.get('iteration_observers',solver_diagnostic))

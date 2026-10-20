@@ -119,3 +119,6 @@ def main():
     a.output.parent.mkdir(parents=True,exist_ok=True)
     a.output.write_text(json.dumps(result,indent=2,allow_nan=False)+'\n')
     print(json.dumps({'output':str(a.output),'method':result['method'],'metrics':result['metrics']},indent=2))
+
+
+if __name__=='__main__':main()

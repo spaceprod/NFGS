@@ -125,12 +125,12 @@ def fortran_cwsin(
     return float(numerator / max(float(denominator), 1e-30))
 
 
-def compute_nf2_metrics(
+def compute_reference_metrics(
     ref_fields: Dict[str, np.ndarray],
     fields: Dict[str, np.ndarray],
     metric_slices: Tuple[slice, slice, slice],
 ) -> Dict[str, float]:
-    """NF2-style magnetic-field and force-freeness metrics on a zyx ROI.
+    """Reference-field agreement and force-freeness metrics on a zyx ROI.
 
     All reported scalars, including ``sigma_J``, are evaluated on
     ``metric_slices`` (the flux-rope-centered test domain used by

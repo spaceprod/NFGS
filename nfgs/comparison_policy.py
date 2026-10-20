@@ -1,9 +1,9 @@
-"""Provenance rules for fixed published NFPT and newly executed GPU comparisons."""
+"""Provenance rules for fixed published NFPT and newly executed classical comparisons."""
 from pathlib import Path
 import csv,hashlib,json
 
 POLICY_ID = "published_nfpt_fixed_v2"
-ACTIVE_METHODS = ("NFGS", "NF2")
+ACTIVE_METHODS = ("NFGS",)
 
 def file_sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -22,6 +22,8 @@ def classify_job(job):
     return "active_controlled" if job["method"] in ACTIVE_METHODS else "local_implementation_supplement"
 
 def require_allowed_job(job,policy):
+    known=set(ACTIVE_METHODS) | {"NFPT_Fortran", "NFPT_GPU", "NFGS_legacy"}
+    if job["method"] not in known:raise ValueError("Unsupported comparison method: "+job["method"])
     if policy and policy["policy_id"]==POLICY_ID and job["method"] not in policy["active_methods"]:
         raise ValueError("The fixed-published policy prohibits this solver in the active queue: "+job["method"])
 
@@ -40,7 +42,7 @@ def published_rows(root):
 def normalize_pause_timings(root,job):
     """Subtract suspension once, using the timer's clock and retaining raw values."""
     root=Path(root);out=root/"runs"/job["id"];interval_file=out/"pause_intervals.json"
-    if not interval_file.exists() or job["method"]!="NF2":return
+    if not interval_file.exists() or job["method"] not in ACTIVE_METHODS:return
     result_file=out/"result.json";result=json.loads(result_file.read_text())
     previous=result.get("pause_timing_adjustment",{})
     if previous.get("version",0)>=2:return

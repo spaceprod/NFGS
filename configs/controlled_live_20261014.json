@@ -32,44 +32,6 @@
     ],
     "dtype": "float32"
   },
-  "NF2": {
-    "repository": "https://github.com/RobertJaro/NF2",
-    "source_commit": "e7b3ae97dcb37161aea6cd9510d9235de396270a",
-    "boundary_weight_multipliers": [
-      0.01,
-      0.025118864315095794,
-      0.06309573444801933,
-      0.15848931924611143,
-      0.3981071705534973,
-      1,
-      2.511886431509582,
-      6.309573444801936,
-      15.848931924611142,
-      39.810717055349734,
-      100
-    ],
-    "seeds": [
-      0,
-      1,
-      2,
-      3,
-      4
-    ],
-    "primary_boundary_information": "bottom_only",
-    "potential_boundary_type": "none",
-    "field_representation": "vector_potential",
-    "boundary_loss_weight": 1,
-    "force_free_loss_weight": 0.001,
-    "loss_scaling": [],
-    "template_data_iterations": 1000,
-    "template_epochs": 15,
-    "training_budget_status": "fixed_15000_steps_without_pilot_by_user_instruction",
-    "precision": "32-true",
-    "reference_field_used_in_training_or_checkpoint_selection": false,
-    "template": "configs/controlled/nf2_bottom_only_template.json",
-    "matmul_precision": "highest",
-    "allow_tf32": false
-  },
   "NFPT": {
     "fortran_source_revision": "local_archive_nfpt_1.0.2_and_nfptpack_1.0.0_checksum_identified",
     "fortran_source_license": null,
@@ -105,8 +67,7 @@
         "sigma_J_max": 0.1,
         "E_rel_Bgt_max": 0.1
       }
-    ],
-    "quality_threshold_status": "predeclared_before_NF2_production"
+    ]
   },
   "sensitivities": {
     "TD1_spacing_factors": [
@@ -161,7 +122,6 @@
     "coordinate-explicit case bundles and P0 scalar tests",
     "NFPT private solver fingerprint and settings",
     "matched actual Fortran/GPU calculation coordinates",
-    "NF2 numpy x-y transpose and bottom-only dataset inspection",
     "anisotropic FastQSL/potential/helicity support",
     "fixed 15000 production steps, no separate pilot"
   ],
@@ -178,13 +138,12 @@
     ],
     "exact_box_resolution_Fortran_limitation": "unmodified native solver is isotropic; no invalid anisotropic coordinate reinterpretation",
     "NFGS_and_NFPT_GPU_torch": "2.4.0",
-    "NF2_torch": "2.6.0, required by pinned upstream; recorded implementation environment difference",
     "Fortran_solver_policy": "private; never publish source, executable, or local adapter",
-    "no_pilot": true,
-    "NF2_noise_testing_uses_paired_dimensionless_input_noise_not_claimed_HMI_errors": true
+    "no_pilot": true
   },
   "submission_administrative_items": [
     "funding information",
     "real archival DOI; never fabricate"
-  ]
+  ],
+  "historical_configuration_not_current_campaign": true
 }

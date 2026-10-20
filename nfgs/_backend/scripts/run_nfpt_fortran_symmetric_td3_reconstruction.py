@@ -42,7 +42,7 @@ from nfgs._backend.scripts.run_nfpt_fortran_td_reconstruction import (  # noqa: 
     write_par,
 )
 from nfgs._backend.scripts.run_nfgs_td_robin_weight_sweep import field_cache_dir  # noqa: E402
-from nfgs._backend.util.metrics import compute_nf2_metrics  # noqa: E402
+from nfgs._backend.util.metrics import compute_reference_metrics  # noqa: E402
 from nfgs._backend.util.nfpt_fortran_compat import nfpt_fortran_grid  # noqa: E402
 from nfgs._backend.util.td2_io import load_b_czyx  # noqa: E402
 
@@ -196,7 +196,7 @@ def main() -> int:
             "Jz": jz,
         }.items()
     }
-    metrics = compute_nf2_metrics(case["reference"], fields, case["metric_slices"])
+    metrics = compute_reference_metrics(case["reference"], fields, case["metric_slices"])
     history = read_history(run_dir)
     sigmas = history.get("sigma", [])
     iters = history.get("iter", [])

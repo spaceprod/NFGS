@@ -7,7 +7,7 @@
     "field_dir": "{output_root}/rho_full/fields",
     "nfpt_field_dir": "{project_root}/data/nfpt",
     "output_dir": "{output_root}/figures",
-    "weights": "1,0.4,0.1,0",
+    "weights": "1,0.5,0.1,0",
     "tube_radius": 3.8
   },
   "depends_on": [

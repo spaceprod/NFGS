@@ -11,8 +11,7 @@
   "published_nfpt_replaced": false,
   "original_protocol_equivalence_verified": false,
   "new_methods": [
-    "NFGS",
-    "NF2"
+    "NFGS"
   ],
   "private_fortran_redistributed": false,
   "completed_padding_evidence": {
@@ -20,5 +19,6 @@
     "TD3_auxiliary": 3,
     "local_NFPT_reproduction": 7
   },
-  "steady_end_to_end_timing_for_future_runs": true
+  "steady_end_to_end_timing_for_future_runs": true,
+  "historical_configuration_not_current_campaign": true
 }

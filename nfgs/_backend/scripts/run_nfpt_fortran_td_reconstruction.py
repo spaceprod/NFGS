@@ -38,7 +38,7 @@ from nfgs._backend.scripts.run_nfgs_td_robin_weight_sweep import (  # noqa: E402
     field_cache_dir,
     load_field_cache,
 )
-from nfgs._backend.util.metrics import compute_nf2_metrics  # noqa: E402
+from nfgs._backend.util.metrics import compute_reference_metrics  # noqa: E402
 from nfgs._backend.util.td2_io import load_b_czyx  # noqa: E402
 
 DEFAULT_SWEEP_DIR = ROOT / "results" / "nfgs_td_robin_weight_sweep"
@@ -299,7 +299,7 @@ def metrics_record(
     b_path: Path,
     j_path: Path,
 ) -> dict[str, Any]:
-    metrics = compute_nf2_metrics(case["reference"], fields, case["metric_slices"])
+    metrics = compute_reference_metrics(case["reference"], fields, case["metric_slices"])
     iters = history.get("iter", [])
     sigmas = history.get("sigma", [])
     best_iter = int(iters[int(np.nanargmin(sigmas))]) if sigmas else 0

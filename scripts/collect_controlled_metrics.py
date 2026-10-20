@@ -41,7 +41,6 @@ def main():
     result=json.loads((out/'result.json').read_text());assert result['case_sha256']==meta['sha256'];assert result['field_sha256']==sha(out/'field.npz')
     assert record['source_sha256']['reference']==meta['sha256']['reference.npz'], 'Immutable reference hash changed'
     assert record['source_sha256']['boundary']==meta['sha256']['boundary.npz'], 'Immutable observed input hash changed'
-    assert sha(folder/'nf2_boundary_xy.npz')==meta['sha256']['nf2_boundary_xy.npz'], 'Immutable NF2 input hash changed'
     policy=read_policy(a.root)
     record['evidence_origin']='new_execution'
     record['evaluation_protocol']='common_fd2_gs_v1'

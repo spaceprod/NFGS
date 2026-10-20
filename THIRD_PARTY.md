@@ -19,15 +19,12 @@ data archive. They are archived inputs to structural comparisons. The reported
 NFPT, VFVP and SSW metric values are quoted from Yi et al. (2022), Tables 2--4;
 the archive is not represented as a reimplementation of those published solvers.
 
-## Planned NF2 comparison and distribution scope
+## Private external solvers
 
-The planned NF2 backend is an external, separately installed GPL-3.0 program.
-Its source is not vendored into this BSD-3 solver package or relicensed.
-Coordinate-explicit NPZ files form the comparison interface. Upstream commit
-and license must be recorded with every run. The original NFPT Fortran solver is a private external dependency. Its source,
-executables and local build scripts must not be published in this repository,
-GitHub releases or Zenodo archives. Settings and checksums may be recorded;
-NFPT solver execution cannot be reproduced from public files alone.
+The original NFPT Fortran solver is private. Source, executables and local
+build scripts must not be published in the repository or releases. Repeating
+that solver requires separate access; authorized archived comparison fields
+and original published scores remain available.
 
 FastQSL's modified CUDA subtree retains CC BY-NC-SA 4.0, its attribution and
 its noncommercial/share-alike conditions. The repository is a collection of

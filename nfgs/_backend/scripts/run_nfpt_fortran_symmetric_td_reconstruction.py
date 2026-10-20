@@ -39,7 +39,7 @@ from nfgs._backend.scripts.run_nfgs_td_robin_weight_sweep import (  # noqa: E402
     field_cache_dir,
     load_field_cache,
 )
-from nfgs._backend.util.metrics import compute_nf2_metrics  # noqa: E402
+from nfgs._backend.util.metrics import compute_reference_metrics  # noqa: E402
 from nfgs._backend.util.nfpt_fortran_compat import nfpt_fortran_grid  # noqa: E402
 from nfgs._backend.util.td2_io import load_b_czyx  # noqa: E402
 
@@ -188,7 +188,7 @@ def run_one(
         run_dir = str(run_dir_path)
 
     slices = paper_metric_slices(case)
-    metrics = compute_nf2_metrics(case["reference"], fields, slices)
+    metrics = compute_reference_metrics(case["reference"], fields, slices)
     sigmas = history.get("sigma", [])
     iters = history.get("iter", [])
     record = {

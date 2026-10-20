@@ -77,11 +77,11 @@ derivation; existing smoothing and net-current correction options still apply.
 The resolved choice is stored in `history["bottom_current_grid_mode"]` as
 `calculation_grid`, `legacy_helper`, or `provided`.
 
-The currently archived `reference_results` belong to the previous always-use-
-calculation-grid policy (`d81c679`, solver version `2026.10.19`). Use that commit
-and the archived settings when reproducing those tables. New runs with the padding-dependent policy
-must be evaluated separately; this update does not assert improved reconstruction
-metrics and does not replace archived tables or figures.
+The bundled `reference_results` contain the completed 2026-10-20 campaign
+with the padding-dependent policy: 33 TD FP32, nine Low--Lou FP32 and three
+Low--Lou FP64 runs. The common diagnostic weight is rho=0.5; case-specific
+minima are 0.3, 0.6 and 0.7. Earlier CSVs retain their provenance under
+`provenance/reference_results_before_20261020`.
 
 ## Reproduce the manuscript
 
@@ -155,37 +155,5 @@ See `docs/reproduction.md` for the manuscript-to-experiment mapping and
 Please cite the accompanying NFGS manuscript and Yi et al. (2022) for NFPT.
 FastQSL retains its CC BY-NC-SA 4.0 license; see `THIRD_PARTY.md`.
 
-## Published NFPT benchmark and live NFGS–NF2 comparison
-
-The [revised comparison plan](docs/controlled_comparison_plan_ko.md) preserves
-published NFPT/VFVP/SSW scores and executes NFGS–NF2 under a common canonical
-input and FD2/GS protocol. The frozen configuration is
-`configs/controlled_published_nfpt_20261014.json`. Original NFPT reference,
-coordinate, scoring and current-operator equivalence is a separate verification
-gate; shared TD parameters alone do not establish it.
-
-```bash
-python scripts/plan_controlled_comparison.py --output results/controlled_design/jobs.json
-PYTHONPATH=. python scripts/run_controlled_status.py
-PYTHONPATH=. python scripts/build_live_comparison_report.py --root results/controlled/live_20261014
-```
-
-The live revised queue contains 512 NFGS/NF2 jobs. Existing inputs, fixed NF2
-15,000-step budgets, five seeds, and completed fields are reused. Local PT jobs,
-logs and archived fields remain separate implementation evidence. Policy and
-snapshot hashes prevent their CCI or runtime from being substituted into the
-published rows. The public `scripts/run_nf2_controlled.py` adapter uses a separately installed
-pinned NF2 environment; upstream NF2 is not vendored. The [overview notebook](notebooks/controlled_comparison_overview.ipynb)
-shows live progress, separate published scores, new Pareto points and timings.
-
-`evaluate.py` requires explicit coordinates/units and uses full-volume FD2 curl
-and full-footprint GS before cropping. All executed rows identify the actual
-protocol. When an original publication protocol is supplied and verified,
-saved fields can be re-evaluated; changed inputs require separate new runs.
-
-The NFPT Fortran solver is private. Sources, executables, build scripts and
-local execution adapters are excluded from the public repository and releases.
-Common evaluation and archived comparison data remain available. Before
-publication, run `python scripts/check_publication_contents.py`.
 
 `evaluate.py` provides common evaluation of supplied magnetic fields. The private NFPT Fortran solver and unauthorized external solver materials are not distributed.

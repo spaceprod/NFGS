@@ -45,6 +45,11 @@
         151,
         251,
         101
+      ],
+      "observed_grid_nodes_xyz": [
+        150,
+        250,
+        100
       ]
     },
     "td2": {
@@ -63,6 +68,11 @@
         151,
         251,
         101
+      ],
+      "observed_grid_nodes_xyz": [
+        150,
+        250,
+        100
       ]
     },
     "td3": {
@@ -81,6 +91,11 @@
         257,
         351,
         201
+      ],
+      "observed_grid_nodes_xyz": [
+        256,
+        350,
+        200
       ]
     }
   },
@@ -139,12 +154,19 @@
   },
   "low_lou_rho_grid": [
     0.0,
-    0.4,
     0.5,
     1.0
   ],
-  "bottom_current_domain": "physical_calculation_grid",
+  "bottom_current_domain": "padding_dependent: legacy_helper when physically padded, calculation_grid otherwise",
   "common_weight_selection": "shared min/max over all 33 TD states; equal mean Euclidean distance in CCI error and common FD2 sigma_J",
-  "common_selected_rho": 0.4,
-  "comparison_methods": []
+  "common_selected_rho": 0.5,
+  "TD_generator_grid_convention": "grid_nodes_xyz is the inherited nominal generator count; td_topology_field evaluates count-1 samples per axis. observed_grid_nodes_xyz gives actual exported grid sizes.",
+  "comparison_methods": [
+    "NFGS"
+  ],
+  "published_baselines": [
+    "NFPT",
+    "VFVP",
+    "SSW"
+  ]
 }

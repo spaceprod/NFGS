@@ -1,0 +1,33 @@
+{
+  "campaign": "conditional_jz_20261020",
+  "TD_runs": 33,
+  "Low_Lou_FP32_runs": 9,
+  "Low_Lou_FP64_runs": 3,
+  "common_rho": 0.5,
+  "case_minima": [
+    0.3,
+    0.6,
+    0.7
+  ],
+  "sha256": {
+    "nfgs_solver.py": "6f84670a68885dc5640f2a9eb1d46685909aa123b48592d2850f158da55663bd",
+    "reference_results/evidence_summary.json": "87a616af6c666478f9fd32a9bee72f6ac8270228b093f20f047ca96bd28ebfbc",
+    "reference_results/low_lou_comparison.json": "6722fcad3220cb57f558cb81dd01cf4e73b2518f3003555d30e1cb5a26a0d4ea",
+    "reference_results/published_methods.csv": "fe0a81d329b37620fa15622b0f91ddf342a0c638d4075add4c1a5c05de952e87"
+  },
+  "validation": {
+    "public_tests_passed": 43,
+    "notebooks": [
+      {
+        "notebook": "notebooks/results_overview.ipynb",
+        "code_cells": 16,
+        "errors": []
+      }
+    ],
+    "private_Fortran_solver_or_binary_published": false,
+    "current_public_comparison_methods": [
+      "NFGS"
+    ],
+    "published_NFPT_scores_preserved": true
+  }
+}

@@ -31,7 +31,7 @@ if str(ROOT) not in sys.path:
 
 from nfgs._backend.experiments.nfgs_paper.analytic_nlfff import benchmarks as analytic  # noqa: E402
 from nfgs_solver import NFGSSolverGPU  # noqa: E402
-from nfgs._backend.util.metrics import compute_nf2_metrics  # noqa: E402
+from nfgs._backend.util.metrics import compute_reference_metrics  # noqa: E402
 from nfgs.diagnostics.common_fd2 import sigma_j as common_fd2_sigma_j  # noqa: E402
 
 
@@ -300,7 +300,7 @@ def run_case(case: dict, *, device: str, dtype: torch.dtype, max_iter: int, args
         )
     wall_s = time.perf_counter() - t0
     fields = {key: np.asarray(value) for key, value in solver.fields_to_numpy().items()}
-    metrics = compute_nf2_metrics(case["reference"], fields, case["metric_slices"])
+    metrics = compute_reference_metrics(case["reference"], fields, case["metric_slices"])
     sigma_common = common_fd2_sigma_j(
         fields, (float(dx), float(dy), float(dz)), case["metric_slices"]
     )
@@ -552,7 +552,7 @@ def main() -> int:
             "sigma": "Fortran-CWsin diagnostic window on the calculation grid",
             "divB_and_energy": "complete calculation grid",
             "iteration_PDE_updates": "attempted pre-rollback candidate interior",
-            "final_NF2_metrics": "the exact per-case metric_slices_zyx contract",
+            "final_reference_metrics": "the exact per-case metric_slices_zyx contract",
         },
         "smoke_warning": (
             "A max_iter value of 1 validates the execution path only and must not "

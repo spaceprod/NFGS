@@ -57,7 +57,7 @@ from nfgs._backend.scripts.run_nfgs_td_robin_weight_sweep import (  # noqa: E402
     parse_weights,
 )
 from nfgs_solver import NFGSSolverGPU  # noqa: E402
-from nfgs._backend.util.metrics import compute_nf2_metrics  # noqa: E402
+from nfgs._backend.util.metrics import compute_reference_metrics  # noqa: E402
 
 METRIC_KEYS = ["C_vec", "C_CS", "Eprime_n", "Eprime_m", "epsilon", "sigma_J"]
 METRIC_LABELS = {
@@ -1652,7 +1652,7 @@ def main() -> int:
                 if reuse_fields and cache_path.is_file() and not force:
                     print(f"    load {cache_path.name}", flush=True)
                     fields = load_field_cache(cache_path)
-                    metrics = compute_nf2_metrics(
+                    metrics = compute_reference_metrics(
                         case["reference"], fields, case["metric_slices"]
                     )
                     record = {

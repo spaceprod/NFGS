@@ -51,7 +51,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from nfgs_solver import StableNFPTSolverGPU  # noqa: E402
 from nfgs._backend.util.lnl_io import build_lnl_jarolim_c2_reference_and_obs  # noqa: E402
-from nfgs._backend.util.metrics import compute_nf2_metrics  # noqa: E402
+from nfgs._backend.util.metrics import compute_reference_metrics  # noqa: E402
 from nfgs._backend.util.td2_io import TD2Grid, build_td2_reference_and_obs, load_b_czyx  # noqa: E402
 from nfgs._backend.util.fastqsl_plane import DEFAULT_FASTQSL_ROOT, compute_y0_qmap  # noqa: E402
 from nfgs.diagnostics.topology_metrics import (  # noqa: E402
@@ -65,14 +65,6 @@ INIT_LABELS = {
     "potential": "PF",
     "curl_free_current": "CFCF",
     "auto_rbsl": "Auto-RBSL",
-}
-JAROLIM_C2 = {
-    "C_vec": 1.00,
-    "C_CS": 0.93,
-    "Eprime_n": 0.84,
-    "Eprime_m": 0.68,
-    "epsilon": 1.07,
-    "sigma_J": 0.0351,
 }
 METRIC_KEYS = (
     "C_vec",
@@ -275,7 +267,7 @@ def run_stable_case(
         )
     wall_time = time.perf_counter() - t0
     fields = fields_from_solver(solver)
-    metrics = compute_nf2_metrics(case["reference"], fields, case["metric_slices"])
+    metrics = compute_reference_metrics(case["reference"], fields, case["metric_slices"])
     sz, sy, sx = case["metric_slices"]
     j_roi = np.stack([fields["Jx"], fields["Jy"], fields["Jz"]], axis=0)[:, sz, sy, sx]
     current_norm_sum = float(np.sqrt(np.sum(j_roi * j_roi, axis=0)).sum())
@@ -334,7 +326,7 @@ def load_fortran_td_record(
     bx, by, bz = load_b_czyx(str(b_path), nx, ny, nz)
     jx, jy, jz = load_b_czyx(str(j_path), nx, ny, nz)
     fields = {"Bx": bx, "By": by, "Bz": bz, "Jx": jx, "Jy": jy, "Jz": jz}
-    metrics = compute_nf2_metrics(case["reference"], fields, case["metric_slices"])
+    metrics = compute_reference_metrics(case["reference"], fields, case["metric_slices"])
     history = np.loadtxt(history_path, ndmin=2) if history_path.is_file() else np.empty((0, 2))
     record = {
         "benchmark": "td",
@@ -362,39 +354,8 @@ def load_fortran_td_record(
     return record, fields
 
 
-def published_precision_better(metric: str, value: float) -> bool:
-    if not math.isfinite(float(value)):
-        return False
-    reference = JAROLIM_C2[metric]
-    value_published = round(float(value), 2 if metric != "sigma_J" else 4)
-    if metric in ("C_vec", "C_CS", "Eprime_n", "Eprime_m"):
-        return value_published >= reference
-    if metric == "epsilon":
-        return abs(value_published - 1.0) <= abs(reference - 1.0)
-    return value_published <= reference
 
 
-def jarolim_comparison(record: dict[str, Any]) -> dict[str, Any]:
-    comparison: dict[str, Any] = {}
-    for key in METRIC_KEYS:
-        value = float(record[key])
-        reference = float(JAROLIM_C2[key])
-        if key == "epsilon":
-            gain = abs(reference - 1.0) - abs(value - 1.0)
-        elif key in ("sigma_J",):
-            gain = reference - value
-        else:
-            gain = value - reference
-        comparison[key] = {
-            "stable": value,
-            "jarolim_c2": reference,
-            "improvement": gain,
-            "equal_or_better_at_published_precision": published_precision_better(key, value),
-        }
-    comparison["all_equal_or_better_at_published_precision"] = all(
-        comparison[key]["equal_or_better_at_published_precision"] for key in METRIC_KEYS
-    )
-    return comparison
 
 
 def write_metrics_csv(path: Path, records: list[dict[str, Any]]) -> None:
@@ -929,12 +890,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print("Original Fortran TD output was not found; Figure 1 will be skipped.")
 
-    lnl_records = [record for record in records if record["benchmark"] == "low_lou_c2" and record["solver"] == SOLVER_PUBLIC_NAME]
-    comparison = {record["init_mode"]: jarolim_comparison(record) for record in lnl_records}
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_metrics_csv(args.output_dir / "metrics.csv", records)
     (args.output_dir / "metrics.json").write_text(json.dumps(json_safe(records), indent=2))
-    (args.output_dir / "jarolim_c2_comparison.json").write_text(json.dumps(json_safe(comparison), indent=2))
     write_latex_rows(args.output_dir / "analytic_table_rows.tex", records)
 
     if not args.skip_figures:
@@ -963,8 +921,6 @@ def main(argv: list[str] | None = None) -> int:
         topology_records = run_td_topology_qsl(args)
         print(f"FastQSL topology cases={len(topology_records)}")
 
-    all_better = [mode for mode, result in comparison.items() if result["all_equal_or_better_at_published_precision"]]
-    print(f"Jarolim C2 equal-or-better across all six published metrics: {all_better}")
     print(f"metrics={args.output_dir / 'metrics.csv'}")
     return 0
 

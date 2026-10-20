@@ -57,7 +57,7 @@ from nfgs._backend.util.fastqsl_plane import (  # noqa: E402
 )
 from nfgs._backend.util.field_ops import curl_zyx_nfpt  # noqa: E402
 from nfgs._backend.util.metrics import (  # noqa: E402
-    compute_nf2_metrics,
+    compute_reference_metrics,
     flux_rope_center_from_bottom_jz,
     test_domain_slices_zyx,
 )
@@ -543,7 +543,7 @@ def run_case(
         else None
     )
     fields = {key: np.asarray(value) for key, value in solver.fields_to_numpy().items()}
-    metrics = compute_nf2_metrics(case["reference"], fields, case["metric_slices"])
+    metrics = compute_reference_metrics(case["reference"], fields, case["metric_slices"])
     source = solver.compute_source_diagnostics()
     record = {
         "benchmark": case["benchmark"],
@@ -1011,7 +1011,7 @@ def main() -> int:
         if args.reuse_field_cache and cache_path.is_file():
             print(f"Loading cached {case['display']} | NFGS | {args.init_mode}", flush=True)
             fields = _load_cached_fields(cache_path)
-            metrics = compute_nf2_metrics(case["reference"], fields, case["metric_slices"])
+            metrics = compute_reference_metrics(case["reference"], fields, case["metric_slices"])
             record = {
                 "benchmark": case["benchmark"],
                 "benchmark_display": case["display"],

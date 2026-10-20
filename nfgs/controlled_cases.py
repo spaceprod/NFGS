@@ -37,10 +37,9 @@ def prepare_case(root,spec):
         for k in boundary:boundary[k]+=rng.normal(0,rms*(noise['Bz'] if k=='Bz' else noise['Bh']),boundary[k].shape)
         os.link(clean/'reference.npz',folder/'reference.npz')
         np.savez_compressed(folder/'boundary.npz',**boundary,**other)
-        np.savez_compressed(folder/'nf2_boundary_xy.npz',**{k.lower():v.T.astype(np.float32) for k,v in boundary.items()})
-        result.update(case=spec['id'],spec=spec,NF2_field_normalization=float(np.sqrt(sum(np.mean(v*v) for v in boundary.values()))))
+        result.update(case=spec['id'],spec=spec)
         result['noise_absolute_sigma']={'Bz':rms*noise['Bz'],'Bh':rms*noise['Bh'],'normalization':'clean boundary vector RMS'}
-        result['sha256']={name:sha(folder/name) for name in ['reference.npz','boundary.npz','nf2_boundary_xy.npz']}
+        result['sha256']={name:sha(folder/name) for name in ['reference.npz','boundary.npz']}
         dump(meta,result);return folder
     if base.startswith('td'):
         case=make_td_case(base,calculation_domain_mode='mudpack_legacy',chunk_depth=4,n_test_x=66,n_test_y=66,n_test_z=30)
@@ -77,15 +76,12 @@ def prepare_case(root,spec):
     payload={**fields,**coords,'field_unit':'benchmark','length_unit':length_unit}
     np.savez_compressed(folder/'reference.npz',**payload)
     np.savez_compressed(folder/'boundary.npz',**boundary,x=coords['x'],y=coords['y'],field_unit='benchmark',length_unit=length_unit)
-    np.savez_compressed(folder/'nf2_boundary_xy.npz',**{k.lower():v.T.astype(np.float32) for k,v in boundary.items()})
     spacing=[float(np.diff(coords[k])[0]) for k in ['x','y','z']]
     result={'schema_version':1,'case':spec['id'],'spec':spec,'grid_xyz':[len(coords[k]) for k in ['x','y','z']],
       'spacing_xyz':spacing,'bounds_xyz':{k:[float(v[0]),float(v[-1])] for k,v in coords.items()},
       'scoring_slices_zyx':[[s.start,s.stop,1] for s in slices],'physical_scoring_bounds':physical_score,
       'source_parameters':params,'length_unit':length_unit,'field_unit':'benchmark',
       'fortran_uniform_scale_supported':bool(np.allclose(spacing,spacing[0],rtol=1e-8)),
-      'NF2_length_normalization':float((coords['x'][-1]-coords['x'][0])/2),
-      'NF2_field_normalization':float(np.sqrt(sum(np.mean(v*v) for v in boundary.values()))),
       'side_top_reference_field_supplied_to_solvers':False,
-      'sha256':{name:sha(folder/name) for name in ['reference.npz','boundary.npz','nf2_boundary_xy.npz']}}
+      'sha256':{name:sha(folder/name) for name in ['reference.npz','boundary.npz']}}
     dump(meta,result);return folder
