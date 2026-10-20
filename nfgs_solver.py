@@ -25,13 +25,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-__version__ = "2026.10.19"
+__version__ = "2026.10.20"
 __all__ = ["NFGSSolverGPU", "compute_mbsl_boundary_metrics"]
 STANDALONE_SOURCE_SHA256 = {
     "grid": "5159ca63ad26d29a6a68c5294324df6029682ce7202207ca251284d3d2e06202",
     "base": "4ebb6b8023a54e243fd2f20d11e23dc3324529c3a598546ad392c2ce27c89aaa",
     "stable": "e29420207dc4c2b0a6798e654bf236215a5bb0626007f860569201319c4f7c91",
-    "nfgs": "49c8a6a5200789f413a161b445c2f62dc0f7d043288c939fa7c6032540ced04d",
+    "nfgs": "a1e91b72bb2448d8e35f0e5f85bd8818cb0ec30746fbcef37c5dfe5d79ee9a1b",
 }
 
 # The standalone NFGS public API does not expose the legacy Auto-RBSL
@@ -3916,6 +3916,10 @@ class NFGSSolverGPU(StableNFPTSolverGPU):
     same modal basis.  The default physical horizontal zero-mode closure is the
     current-free ``frozen_linear_harmonic`` lift; height-coupled alternatives
     must be selected explicitly for sensitivity experiments.
+
+    Bottom-current preparation follows the physical domain: an unpadded
+    domain uses its own calculation grid, while a padded domain retains
+    the inherited legacy helper-grid calculation and current balancing.
     """
 
     def __init__(self, *args, **kwargs):
@@ -4485,18 +4489,33 @@ class NFGSSolverGPU(StableNFPTSolverGPU):
     def _derive_bottom_jz_fortran(
         self, Bx_obs: torch.Tensor, By_obs: torch.Tensor, *, ijzbcor: int = 3
     ) -> torch.Tensor:
-        """Derive and balance bottom current on the calculation grid.
+        """Choose bottom-current preparation from physical domain padding.
 
         The vector maps must already be embedded in the physical calculation
-        domain. Exterior nodes carry zero current; no second grid extension
-        is used. The inherited sign-separated current-balancing convention
-        is retained.
+        domain. With padding, retain the inherited helper-grid calculation
+        and balancing exactly. Without padding, use the calculation grid
+        directly and set its exterior current nodes to zero. A buffer-window
+        flag alone does not constitute additional physical padding.
         """
         if tuple(Bx_obs.shape) != (self.Ny, self.Nx) or By_obs.shape != Bx_obs.shape:
             raise ValueError(
                 "Bottom vector maps must be embedded in the calculation grid "
                 f"{(self.Ny, self.Nx)} before deriving Jz."
             )
+        calculation_shape = (getattr(self, "Nz", 0), self.Ny, self.Nx)
+        physical_padding = any(
+            shape is not None
+            and any(calculated > observed for calculated, observed in zip(calculation_shape, shape))
+            for shape in (
+                getattr(self, "_input_shape_zyx", None),
+                getattr(self, "_observed_shape_zyx", None),
+            )
+        ) or any(pad > 0 for pad in getattr(self, "_calculation_pad_xy", (0, 0)))
+        if physical_padding:
+            self._bottom_current_grid_mode = "legacy_helper"
+            return super()._derive_bottom_jz_fortran(Bx_obs, By_obs, ijzbcor=ijzbcor)
+
+        self._bottom_current_grid_mode = "calculation_grid"
         jz = torch.zeros_like(Bx_obs)
         if self.Nx >= 3 and self.Ny >= 3:
             jz[1:-1, 1:-1] = (
@@ -4558,6 +4577,7 @@ class NFGSSolverGPU(StableNFPTSolverGPU):
             "padded_buffer_zone": padded_buffer_zone,
             "ijzbcor": ijzbcor,
         }
+        self._bottom_current_grid_mode = "provided" if Jz_obs is not None else None
 
         out = super().set_bottom_boundary(
             Bz_obs=Bz_obs,
@@ -6934,6 +6954,7 @@ class NFGSSolverGPU(StableNFPTSolverGPU):
         self._last_iteration_diagnostics = {}
         history = super().iterate(*args, init_mode=mode, **kwargs)
         history["source_partition_mode"] = self.source_partition_mode
+        history["bottom_current_grid_mode"] = self._bottom_current_grid_mode
         history["vertical_current_operator"] = self.vertical_current_operator
         history["sigma_placement"] = (
             "vertical_faces"
@@ -7107,6 +7128,7 @@ class NFGSSolverGPU(StableNFPTSolverGPU):
             "bottom_divergence_robin_weight": self.bottom_divergence_robin_weight,
             "poloidal_update_mode": self.poloidal_update_mode,
             "vertical_current_operator": self.vertical_current_operator,
+            "bottom_current_grid_mode": self._bottom_current_grid_mode,
             "vertical_staggered_face": dict(
                 self._last_staggered_face_diagnostics
             ),

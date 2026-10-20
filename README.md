@@ -5,9 +5,10 @@ of the photospheric coronal-current imprint (CCI).
 
 Companion code for **GPU-Accelerated Reconstruction of Solar Coronal Nonlinear Force-Free
 Fields using Gaussian Separation with Coronal-Current Imprint Control**.
-The production settings reproduce the current manuscript's TD weight scan,
-Low--Lou validation at rho = 0, 0.5 and 1, common-current metrics, FastQSL connectivity
-and twist, six-face energy and helicity, and diagnostic weight sensitivity.
+The experiment settings cover the manuscript's TD weight scan, Low--Lou validation
+at rho = 0, 0.5 and 1, common-current metrics, FastQSL connectivity and twist,
+six-face energy and helicity, and diagnostic weight sensitivity. Archived results
+retain their original solver provenance; later solver updates do not rewrite them.
 
 ## Layout
 
@@ -65,6 +66,22 @@ Boundary components have shape `(Ny, Nx)`; output fields have shape `(Nz, Ny,
 Nx)`. The normalized current is `J = curl(B)`; convert to physical SI current
 with the permeability factor when the field and length units are SI.
 `examples/reconstruct_npz.py` supplies a complete command-line example.
+
+
+As of solver version `2026.10.20`, automatically derived bottom `Jz` uses the
+physical calculation grid when no padding is present. If the observed domain
+is extended laterally or vertically, it uses the inherited legacy helper-grid
+calculation and sign-separated current balancing. A buffer permission/window
+flag alone does not count as physical padding. Explicit `Jz_obs` bypasses automatic
+derivation; existing smoothing and net-current correction options still apply.
+The resolved choice is stored in `history["bottom_current_grid_mode"]` as
+`calculation_grid`, `legacy_helper`, or `provided`.
+
+The currently archived `reference_results` belong to the previous always-use-
+calculation-grid policy (`d81c679`, solver version `2026.10.19`). Use that commit
+and the archived settings when reproducing those tables. New runs with the padding-dependent policy
+must be evaluated separately; this update does not assert improved reconstruction
+metrics and does not replace archived tables or figures.
 
 ## Reproduce the manuscript
 

@@ -1,0 +1,77 @@
+{
+  "solver_version": "2026.10.20",
+  "policy": "physical padding selects legacy helper; no padding selects calculation grid",
+  "physical_padding_dimensions": [
+    "x",
+    "y",
+    "z"
+  ],
+  "supplied_Jz": "automatic derivation bypassed; existing smoothing and net-current correction options retained",
+  "previous_always_calculation_grid_commit": "d81c679",
+  "archived_reference_results_replaced": false,
+  "full_nonlinear_TD_campaign_rerun": false,
+  "source_sha256": {
+    "solvers/nfgs/nfgs_solver.py": "a1e91b72bb2448d8e35f0e5f85bd8818cb0ec30746fbcef37c5dfe5d79ee9a1b",
+    "release/nfgs_standalone/nfgs_solver.py": "6f84670a68885dc5640f2a9eb1d46685909aa123b48592d2850f158da55663bd"
+  },
+  "validation": {
+    "local_regression_passed": 69,
+    "local_regression_skipped": 1,
+    "canonical_boundary_checks": [
+      {
+        "case": "td1",
+        "padding": [
+          22,
+          22,
+          4,
+          4,
+          29
+        ],
+        "selected_policy": "legacy_helper",
+        "expected_Jz_bitwise_equal": true,
+        "scope": "bottom-current operator on canonical TD input; no nonlinear reconstruction"
+      },
+      {
+        "case": "td2",
+        "padding": [
+          22,
+          22,
+          4,
+          4,
+          29
+        ],
+        "selected_policy": "legacy_helper",
+        "expected_Jz_bitwise_equal": true,
+        "scope": "bottom-current operator on canonical TD input; no nonlinear reconstruction"
+      },
+      {
+        "case": "td3",
+        "padding": [
+          1,
+          1,
+          18,
+          18,
+          57
+        ],
+        "selected_policy": "legacy_helper",
+        "expected_Jz_bitwise_equal": true,
+        "scope": "bottom-current operator on canonical TD input; no nonlinear reconstruction"
+      },
+      {
+        "case": "td3",
+        "padding": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "selected_policy": "calculation_grid",
+        "expected_Jz_bitwise_equal": true,
+        "scope": "bottom-current operator on canonical TD input; no nonlinear reconstruction"
+      }
+    ],
+    "automatic_padded_initialization_and_two_steps_equal_legacy": true,
+    "public_repository_passed": 43
+  }
+}
